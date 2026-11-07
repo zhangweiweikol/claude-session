@@ -162,11 +162,147 @@ CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder_id);
 	}
 
 	// trigram 对中文子串搜索友好；若当前 SQLite 构建不支持则退回 unicode61。
+	if err := s.createFTS(); err != nil {
+		return err
+	}
+	// 旧库的全文表没有 summary 列，需要重建并强制重新索引。
+	if !s.hasColumn("sessions_fts", "summary") {
+		if _, err := s.db.Exec(`DROP TABLE sessions_fts`); err != nil {
+			return err
+		}
+		if err := s.createFTS(); err != nil {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE sessions SET file_mtime = -1`); err != nil {
+			return err
+		}
+	}
+	// 旧库通过 ALTER 补列后才允许建索引，新库在建表语句里已包含该列。
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id)`); err != nil {
+		return err
+	}
+
+	// AI 概要、归类建议与任务状态。独立于 sessions，避免扫描 upsert 覆盖派生数据。
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS session_ai (
+  session_id      TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  summary         TEXT NOT NULL DEFAULT '',
+  suggested_title TEXT NOT NULL DEFAULT '',
+  topics          TEXT NOT NULL DEFAULT '',
+  model           TEXT NOT NULL DEFAULT '',
+  profile         TEXT NOT NULL DEFAULT '',
+  status          TEXT NOT NULL DEFAULT 'pending',
+  error           TEXT NOT NULL DEFAULT '',
+  confidence      REAL NOT NULL DEFAULT 0,
+  lineage_mode    TEXT NOT NULL DEFAULT '',
+  drift           REAL NOT NULL DEFAULT 0,
+  source_mtime    INTEGER NOT NULL DEFAULT 0,
+  source_size     INTEGER NOT NULL DEFAULT 0,
+  in_tokens       INTEGER NOT NULL DEFAULT 0,
+  out_tokens      INTEGER NOT NULL DEFAULT 0,
+  cost_usd        REAL NOT NULL DEFAULT 0,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_session_ai_status ON session_ai(status);
+
+CREATE TABLE IF NOT EXISTS ai_jobs (
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  project_id INTEGER NOT NULL DEFAULT 0,
+  status     TEXT NOT NULL,
+  total      INTEGER NOT NULL DEFAULT 0,
+  done       INTEGER NOT NULL DEFAULT 0,
+  failed     INTEGER NOT NULL DEFAULT 0,
+  error      TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_project ON ai_jobs(project_id, kind, status);
+
+CREATE TABLE IF NOT EXISTS ai_suggestions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  folder_id   INTEGER NOT NULL DEFAULT 0,
+  new_folder  TEXT NOT NULL DEFAULT '',
+  folder_path TEXT NOT NULL DEFAULT '',
+  action      TEXT NOT NULL,
+  confidence  REAL NOT NULL DEFAULT 0,
+  reason      TEXT NOT NULL DEFAULT '',
+  applied     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_suggestions_job ON ai_suggestions(job_id);
+
+CREATE TABLE IF NOT EXISTS ai_folder_suggestions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      TEXT NOT NULL,
+  parent_id   INTEGER NOT NULL DEFAULT 0,
+  parent_name TEXT NOT NULL DEFAULT '',
+  parent_path TEXT NOT NULL DEFAULT '',
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  confidence  REAL NOT NULL DEFAULT 0,
+  applied     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_folder_suggestions_job ON ai_folder_suggestions(job_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`); err != nil {
+		return err
+	}
+
+	// 归类来源：manual 的会话永不参与自动移动，ai 的会话可被后续整理更新。
+	if !s.hasColumn("sessions", "folder_source") {
+		if _, err := s.db.Exec(`ALTER TABLE sessions ADD COLUMN folder_source TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !s.hasColumn("folders", "source") {
+		if _, err := s.db.Exec(`ALTER TABLE folders ADD COLUMN source TEXT NOT NULL DEFAULT 'user'`); err != nil {
+			return err
+		}
+	}
+	if !s.hasColumn("folders", "description") {
+		if _, err := s.db.Exec(`ALTER TABLE folders ADD COLUMN description TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	// 归类建议的结构化引用：已有归类用 folder_id，本批新建用 new_folder / parent_name。
+	if !s.hasColumn("ai_suggestions", "folder_id") {
+		if _, err := s.db.Exec(`ALTER TABLE ai_suggestions ADD COLUMN folder_id INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !s.hasColumn("ai_suggestions", "new_folder") {
+		if _, err := s.db.Exec(`ALTER TABLE ai_suggestions ADD COLUMN new_folder TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !s.hasColumn("ai_folder_suggestions", "parent_id") {
+		if _, err := s.db.Exec(`ALTER TABLE ai_folder_suggestions ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !s.hasColumn("ai_folder_suggestions", "parent_name") {
+		if _, err := s.db.Exec(`ALTER TABLE ai_folder_suggestions ADD COLUMN parent_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createFTS 建立包含概要列的全文索引，trigram 不可用时退回 unicode61。
+func (s *Store) createFTS() error {
 	if _, err := s.db.Exec(`
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
   session_id UNINDEXED,
   title,
   last_prompt,
+  summary,
   content,
   tokenize='trigram'
 );`); err != nil {
@@ -175,15 +311,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
   session_id UNINDEXED,
   title,
   last_prompt,
+  summary,
   content,
   tokenize='unicode61'
 );`); err != nil {
 			return err
 		}
-	}
-	// 旧库通过 ALTER 补列后才允许建索引，新库在建表语句里已包含该列。
-	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id)`); err != nil {
-		return err
 	}
 	return nil
 }
@@ -330,7 +463,7 @@ ORDER BY p.pinned DESC, p.sort_order ASC, COUNT(s.id) DESC, p.cwd ASC`)
 
 func (s *Store) ListFolders(ctx context.Context, projectID int64) ([]model.Folder, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, project_id, parent_id, name, sort_order
+SELECT id, project_id, parent_id, name, sort_order, source, description
 FROM folders WHERE project_id = ?
 ORDER BY sort_order ASC, name ASC, id ASC`, projectID)
 	if err != nil {
@@ -342,7 +475,7 @@ ORDER BY sort_order ASC, name ASC, id ASC`, projectID)
 	for rows.Next() {
 		var f model.Folder
 		var parent sql.NullInt64
-		if err := rows.Scan(&f.ID, &f.ProjectID, &parent, &f.Name, &f.SortOrder); err != nil {
+		if err := rows.Scan(&f.ID, &f.ProjectID, &parent, &f.Name, &f.SortOrder, &f.Source, &f.Description); err != nil {
 			return nil, err
 		}
 		if parent.Valid {
@@ -414,6 +547,7 @@ func (s *Store) ListSessions(ctx context.Context, f model.SessionFilter) ([]mode
 	if q := strings.TrimSpace(f.Query); q != "" {
 		if utf8.RuneCountInString(q) >= 3 {
 			if sessions, err := s.searchSessions(ctx, f, where, args); err == nil {
+				s.attachAISummaries(ctx, sessions)
 				return sessions, nil
 			}
 		}
@@ -445,7 +579,11 @@ LIMIT ?`
 		}
 		out = append(out, sess)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.attachAISummaries(ctx, out)
+	return out, nil
 }
 
 func (s *Store) searchSessions(ctx context.Context, f model.SessionFilter, where []string, args []any) ([]model.Session, error) {
@@ -454,7 +592,7 @@ func (s *Store) searchSessions(ctx context.Context, f model.SessionFilter, where
 	queryArgs = append(queryArgs, f.Limit)
 
 	query := `SELECT ` + sessionColumnsWithParent + `,
-       snippet(sessions_fts, 3, char(1), char(2), '…', 16)
+       snippet(sessions_fts, -1, char(1), char(2), '…', 16)
 FROM sessions s
 JOIN sessions_fts ON sessions_fts.session_id = s.id
 LEFT JOIN sessions ps ON ps.id = s.parent_id
@@ -491,7 +629,13 @@ FROM sessions s
 LEFT JOIN sessions ps ON ps.id = s.parent_id
 JOIN projects p ON p.id = s.project_id
 WHERE s.id = ?`, id)
-	return scanSessionWithParent(row)
+	sess, err := scanSessionWithParent(row)
+	if err != nil {
+		return model.Session{}, err
+	}
+	list := []model.Session{sess}
+	s.attachAISummaries(ctx, list)
+	return list[0], nil
 }
 
 // Lineage 返回从根到父会话的链，用于详情页血缘导航。遇到缺失父或循环时停止。
@@ -825,7 +969,8 @@ func (s *Store) AutoDisplayAllowed(ctx context.Context, id string) (bool, error)
 }
 
 func (s *Store) SetSessionFolder(ctx context.Context, id string, folderID *int64) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET folder_id = ? WHERE id = ?`, folderID, id)
+	// 用户手动移动：标记为 manual，AI 不再自动调整该会话的归类。
+	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET folder_id = ?, folder_source = 'manual' WHERE id = ?`, folderID, id)
 	if err != nil {
 		return err
 	}
@@ -855,7 +1000,8 @@ func (s *Store) SessionFolder(ctx context.Context, id string) (folderID *int64, 
 
 // InheritFolderIfEmpty 仅在会话尚未归类时写入归类，避免覆盖用户手动调整。
 func (s *Store) InheritFolderIfEmpty(ctx context.Context, id string, folderID int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET folder_id = ? WHERE id = ? AND folder_id IS NULL`, folderID, id)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET folder_id = ?, folder_source = 'inherited' WHERE id = ? AND folder_id IS NULL`, folderID, id)
 	return err
 }
 
@@ -957,12 +1103,35 @@ func (s *Store) IndexSession(ctx context.Context, id, title, lastPrompt, content
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions_fts WHERE session_id = ?`, id); err != nil {
 		return err
 	}
+	// 概要由 AI 异步生成，扫描阶段先索引正文；生成后通过 UpdateFTSSummary 回填。
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sessions_fts(session_id, title, last_prompt, content) VALUES(?,?,?,?)`,
+		`INSERT INTO sessions_fts(session_id, title, last_prompt, summary, content) VALUES(?,?,?,'',?)`,
 		id, title, lastPrompt, content); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// UpdateFTSSummary 在概要生成后回填全文索引，让搜索能命中摘要。
+func (s *Store) UpdateFTSSummary(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE sessions_fts
+SET summary = COALESCE((SELECT ai.summary FROM session_ai ai WHERE ai.session_id = ? AND ai.status = 'ok'), '')
+WHERE session_id = ?`, sessionID, sessionID)
+	return err
+}
+
+// BackfillFTSSummary 在扫描后批量回填摘要，覆盖迁移重建或历史缺失的情况。
+func (s *Store) BackfillFTSSummary(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE sessions_fts
+SET summary = COALESCE((SELECT ai.summary FROM session_ai ai
+                        WHERE ai.session_id = sessions_fts.session_id AND ai.status = 'ok'), '')
+WHERE EXISTS (
+  SELECT 1 FROM session_ai ai
+  WHERE ai.session_id = sessions_fts.session_id AND ai.status = 'ok' AND ai.summary <> ''
+)`)
+	return err
 }
 
 func (s *Store) MarkDeleted(ctx context.Context, id string, now int64) error {

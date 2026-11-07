@@ -343,7 +343,8 @@
       chevIcon(expanded, canExpand) +
       (expanded ? FOLDER_OPEN_ICON : FOLDER_ICON) +
       '<span class="f-no">' + number + '</span>' +
-      '<span class="f-name">' + nameHtml + '</span>' +
+      '<span class="f-name">' + nameHtml +
+      (folder.source === 'ai' ? '<span class="f-ai" title="AI 创建的归类">AI</span>' : '') + '</span>' +
       (!query && kids.length > 0 && depth >= maxDepth ? '<span class="f-more">…</span>' : '') +
       '<span></span></button>' +
       '<span class="folder-actions">' +
@@ -860,6 +861,28 @@
     return meta;
   }
 
+  // 概要优先展示 AI 摘要，未生成时回退到全文检索片段或最后一条 prompt。
+  function sessionExcerpt(s, deleted) {
+    // 搜索命中正文或概要时，优先展示带高亮的片段。
+    if (state.query && s.snippet) return highlight(s.snippet);
+    if (s.ai_summary) {
+      return '<span class="s-ai-tag">AI</span>' + esc(s.ai_summary);
+    }
+    if (s.snippet) return highlight(s.snippet);
+    return esc(s.last_prompt || (deleted ? '（已移到回收站，还原后可用）' : '（没有可展示的 prompt 摘要）'));
+  }
+
+  // 建议标题只在会话没有自定义标题时出现，采用后走重命名接口。
+  function suggestTitleHtml(s) {
+    if (!s.ai_can_apply_title || !s.ai_suggested_title) return '';
+    return '<span class="s-title-suggest">' +
+      '<span class="s-title-suggest-label">建议标题</span>' +
+      '<span class="s-title-suggest-value">' + esc(s.ai_suggested_title) + '</span>' +
+      '<span class="s-title-suggest-apply" role="button" tabindex="-1" ' +
+      'data-apply-title="' + esc(s.id) + '" data-title="' + esc(s.ai_suggested_title) + '">采用</span>' +
+      '</span>';
+  }
+
   function buildSessionItem(s) {
     var deleted = s.state === 'deleted';
     var status = sessionStatus(s);
@@ -868,9 +891,7 @@
       (state.selectMode ? ' is-selectable' : '') +
       (checked ? ' is-selected' : '') +
       (s.id === state.sessionId ? ' is-active' : '');
-    var excerpt = s.snippet
-      ? highlight(s.snippet)
-      : esc(s.last_prompt || (deleted ? '（已移到回收站，还原后可用）' : '（没有可展示的 prompt 摘要）'));
+    var excerpt = sessionExcerpt(s, deleted);
     var tp = listTimeParts(deleted && s.deleted_at
       ? new Date(s.deleted_at * 1000).toISOString()
       : s.last_ts);
@@ -893,6 +914,7 @@
       '<span class="s-title-row">' + mark +
       '<span class="s-title">' + esc(s.title) + '</span>' + rowTime + '</span>' +
       '<span class="s-excerpt">' + excerpt + '</span>' +
+      suggestTitleHtml(s) +
       '<span class="s-meta">' + meta.join('') + '</span>' +
       '</span>' + sessionActionsHtml(s) + '</button>';
   }
@@ -909,9 +931,7 @@
       (state.selectMode ? ' is-selectable' : '') +
       (checked ? ' is-selected' : '') +
       (s.id === state.sessionId ? ' is-active' : '');
-    var excerpt = s.snippet
-      ? highlight(s.snippet)
-      : esc(s.last_prompt || (deleted ? '（已移到回收站，还原后可用）' : '（没有可展示的 prompt 摘要）'));
+    var excerpt = sessionExcerpt(s, deleted);
     var tp = listTimeParts(s.last_ts);
     var time = tp.date ? tp.date + ' ' + tp.time : '';
     var meta = [];
@@ -1175,6 +1195,82 @@
     });
   }
 
+  // 详情页顶部概要卡片，四态与列表保持一致。
+  function aiCardHtml(detail) {
+    var s = detail.session;
+    var a = detail.ai;
+    var head = '<div class="ai-card-head"><span class="ai-card-title">AI 概要</span>' +
+      (a && a.status === 'ok' ? '<span class="ai-badge">AI</span>' : '') + '</div>';
+
+    if (!a) {
+      return '<div class="ai-card is-empty">' + head +
+        '<p class="ai-card-hint">还没有生成概要。生成后会显示目标、关键动作与结论，并用于自动归类。</p>' +
+        '<div class="ai-card-actions"><button class="btn btn-sm btn-primary" data-ai-generate="' + esc(s.id) + '">生成概要</button></div>' +
+        '</div>';
+    }
+    if (a.status === 'running' || a.status === 'pending') {
+      return '<div class="ai-card is-loading">' + head +
+        '<div class="ai-skeleton"><i class="sk sk-line"></i><i class="sk sk-line short"></i><i class="sk sk-line"></i></div>' +
+        '<p class="ai-card-hint">正在生成概要…</p></div>';
+    }
+    if (a.status === 'failed') {
+      return '<div class="ai-card is-error">' + head +
+        '<p class="ai-card-hint">生成失败：' + esc(a.error || '模型调用失败') + '</p>' +
+        '<div class="ai-card-actions"><button class="btn btn-sm" data-ai-generate="' + esc(s.id) + '" data-force="1">重试</button></div>' +
+        '</div>';
+    }
+
+    var topics = (a.topics || []).map(function (t) {
+      return '<span class="ai-topic">' + esc(t) + '</span>';
+    }).join('');
+    var titleRow = '';
+    if (!s.custom_title && a.suggested_title) {
+      titleRow = '<div class="ai-title-suggest">' +
+        '<span class="ai-title-suggest-label">建议标题</span>' +
+        '<span class="ai-title-suggest-value">' + esc(a.suggested_title) + '</span>' +
+        '<button class="btn btn-sm" data-ai-apply-title="' + esc(s.id) + '" data-title="' + esc(a.suggested_title) + '">采用</button>' +
+        '</div>';
+    }
+    var meta = [];
+    if (a.lineage_mode === 'delta') meta.push('增量摘要');
+    if (a.lineage_mode === 'inherited') meta.push('继承父会话');
+    if (a.drift) meta.push('主题偏移 ' + a.drift.toFixed(2));
+    if (a.model) meta.push('模型 ' + esc(a.model));
+    if (a.confidence) meta.push('置信度 ' + Math.round(a.confidence * 100) + '%');
+    if (a.cost_usd) meta.push('成本 $' + a.cost_usd.toFixed(4));
+    if (a.updated_at) meta.push('生成于 ' + fmtClock(new Date(a.updated_at * 1000).toISOString()));
+
+    return '<div class="ai-card">' + head +
+      '<p class="ai-card-summary">' + esc(a.summary) + '</p>' +
+      (topics ? '<div class="ai-topics">' + topics + '</div>' : '') +
+      titleRow +
+      '<div class="ai-card-foot"><span class="ai-card-meta">' + meta.join(' · ') + '</span>' +
+      '<button class="btn btn-sm" data-ai-generate="' + esc(s.id) + '" data-force="1">重新生成</button></div>' +
+      '</div>';
+  }
+
+  function aiGenerate(sessionID, force) {
+    var body = { ids: [sessionID], force: !!force };
+    if (state.projectId) body.project_id = state.projectId;
+    api('/api/ai/summarize', { method: 'POST', body: JSON.stringify(body) })
+      .then(function (res) {
+        toast(res.queued ? '已开始生成概要' : '没有需要生成的会话');
+      })
+      .catch(function (e) { toast(e.message, 'error'); });
+  }
+
+  function applySuggestedTitle(sessionID, title) {
+    api('/api/sessions/' + encodeURIComponent(sessionID), {
+      method: 'PATCH',
+      body: JSON.stringify({ title: title })
+    }).then(function () {
+      toast('已采用建议标题');
+      return loadSessions(true);
+    }).then(function () {
+      if (state.sessionId === sessionID) selectSession(sessionID);
+    }).catch(function (e) { toast(e.message, 'error'); });
+  }
+
   function renderDetail(detail) {
     var s = detail.session;
     var deleted = s.state === 'deleted';
@@ -1236,8 +1332,20 @@
       '<span class="detail-status ' + statusClass + '"><span class="s-dot"></span>' + statusText + '</span>' +
       '</div>' + meta + actions;
 
-    $('#thread').innerHTML = '<div class="thread-inner">' + renderMessages(detail) + '</div>';
+    $('#thread').innerHTML = '<div class="thread-inner">' + aiCardHtml(detail) + renderMessages(detail) + '</div>';
     renderLineage(s, detail);
+    var genBtn = $('#thread [data-ai-generate]');
+    if (genBtn) {
+      genBtn.addEventListener('click', function () {
+        aiGenerate(s.id, genBtn.dataset.force === '1');
+      });
+    }
+    var applyTitleBtn = $('#thread [data-ai-apply-title]');
+    if (applyTitleBtn) {
+      applyTitleBtn.addEventListener('click', function () {
+        applySuggestedTitle(s.id, applyTitleBtn.dataset.title);
+      });
+    }
     $('#btnCopyId').addEventListener('click', function () { copyText(s.id, '会话 ID 已复制'); });
 
     var comp = $('#composer');
@@ -1691,6 +1799,375 @@
     });
   }
 
+  /* ---------- AI 概要 ---------- */
+
+  function pollAIJob(jobID, timeoutMs) {
+    var start = Date.now();
+    return new Promise(function (resolve, reject) {
+      function tick() {
+        api('/api/ai/jobs/' + encodeURIComponent(jobID)).then(function (job) {
+          if (job.status === 'done' || job.status === 'failed' || job.status === 'canceled') {
+            resolve(job);
+            return;
+          }
+          if (Date.now() - start > (timeoutMs || 10 * 60 * 1000)) {
+            reject(new Error('任务超时，请稍后重试'));
+            return;
+          }
+          setTimeout(tick, 1500);
+        }).catch(reject);
+      }
+      tick();
+    });
+  }
+
+  // AI 整理：先生成缺失概要，再做项目级归类，最后打开预览。
+  function aiTidy() {
+    if (!state.projectId) { toast('请先选择一个项目', 'error'); return; }
+    var btn = $('#btnAITidy');
+    if (btn.disabled) return;
+
+    var hasAIFolders = (state.folders || []).some(function (f) { return f.source === 'ai'; });
+    var ask = hasAIFolders
+      ? confirmDialog({
+        title: '重新整理归类',
+        message: '项目中已有 AI 创建的归类。选「重新评估」会把这些会话重新分配；选「取消」则只整理未归类的会话。手动整理的会话始终不受影响。',
+        confirmText: '重新评估'
+      })
+      : Promise.resolve(false);
+
+    btn.disabled = true;
+    btn.textContent = '生成概要…';
+
+    ask.then(function (reevaluate) {
+      return api('/api/ai/summarize', {
+        method: 'POST',
+        body: JSON.stringify({ project_id: state.projectId })
+      }).then(function (res) {
+        if (!res.job_id) throw new Error('入队失败');
+        return pollAIJob(res.job_id).then(function () { return reevaluate; });
+      });
+    }).then(function (reevaluate) {
+      btn.textContent = '整理归类…';
+      return api('/api/ai/categorize', {
+        method: 'POST',
+        body: JSON.stringify({ project_id: state.projectId, reevaluate: !!reevaluate })
+      });
+    }).then(function (res) {
+      if (!res.job_id) throw new Error('入队失败');
+      return pollAIJob(res.job_id).then(function (job) {
+        refreshAIStatus();
+        if (!job.total) {
+          return infoDialog({
+            title: '没有可整理的会话',
+            message: res.reason || '当前项目没有可整理的会话。'
+          });
+        }
+        return openSuggestionDialog(res.job_id);
+      });
+    }).catch(function (e) {
+      toast(e.message, 'error');
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = 'AI 整理';
+    });
+  }
+
+  function openSuggestionDialog(jobID) {
+    return api('/api/ai/suggestions?job_id=' + encodeURIComponent(jobID)).then(function (data) {
+      if (data.job && data.job.status === 'failed') {
+        return infoDialog({
+          title: 'AI 整理失败',
+          message: data.job.error || '模型调用失败，请稍后重试。'
+        });
+      }
+      var folders = data.folders || [];
+      var assignments = data.assignments || [];
+      var root = $('#modalRoot');
+
+      var groups = {};
+      folders.forEach(function (f) {
+        var path = (f.parent_path || []).concat([f.name]);
+        var key = path.join('/');
+        groups[key] = { path: path, folder: f, items: [] };
+      });
+      assignments.forEach(function (a) {
+        var path = a.folder_path || [];
+        if (!path.length) return;
+        var key = path.join('/');
+        if (!groups[key]) groups[key] = { path: path, folder: null, items: [] };
+        groups[key].items.push(a);
+      });
+
+      var list = Object.keys(groups).map(function (k) { return groups[k]; });
+      list.sort(function (a, b) {
+        if (!!b.folder !== !!a.folder) return a.folder ? -1 : 1;
+        return a.path.join('/').localeCompare(b.path.join('/'));
+      });
+
+      function sessionTitle(sid) {
+        var item = state.sessionIndex[sid];
+        return item ? item.title : sid.slice(0, 8);
+      }
+
+      var bodyHtml = list.map(function (g) {
+        var lowCount = g.items.filter(function (a) { return a.confidence < 0.6; }).length;
+        var badge = '';
+        if (g.folder) {
+          var parentPath = g.folder.parent_path || [];
+          badge = parentPath.length
+            ? '<span class="ai-sug-new">挂到 ' + esc(parentPath.join(' / ')) + ' 下</span>'
+            : '<span class="ai-sug-new">新建</span>';
+        } else {
+          badge = '<span class="ai-sug-reuse">复用已有</span>';
+        }
+        var header = '<div class="ai-sug-head">' +
+          '<span class="ai-sug-check" data-group-check="' + esc(g.path.join('/')) + '"></span>' +
+          '<span class="ai-sug-path">' + g.path.map(esc).join('<span class="ai-sug-slash">/</span>') + '</span>' +
+          badge +
+          '<span class="ai-sug-count">' + g.items.length + ' 个会话' +
+          (lowCount ? ' · ' + lowCount + ' 个低置信度' : '') + '</span></div>';
+
+        var desc = g.folder && g.folder.description
+          ? '<p class="ai-sug-desc">' + esc(g.folder.description) + '</p>' : '';
+
+        var items = g.items.map(function (a) {
+          var low = a.confidence < 0.6;
+          return '<label class="ai-sug-item' + (low ? ' is-low' : '') + '">' +
+            '<input type="checkbox" class="ai-sug-box" data-session-sug="' + a.id + '"' +
+            (low ? '' : ' checked') + '>' +
+            '<span class="ai-sug-body"><span class="ai-sug-title">' + esc(sessionTitle(a.session_id)) + '</span>' +
+            '<span class="ai-sug-reason">' + esc(a.reason || '') +
+            (low ? '（置信度较低，默认不勾选，可按需选中）' : '') + '</span></span>' +
+            '<span class="ai-sug-conf">' + (a.confidence || 0).toFixed(2) + '</span></label>';
+        }).join('');
+
+        return '<div class="ai-sug-group">' + header + desc + '<div class="ai-sug-items">' + items + '</div></div>';
+      }).join('');
+
+      if (!bodyHtml) {
+        bodyHtml = '<p class="dialog-text">没有可应用的归类建议。</p>';
+      }
+
+      var newCount = folders.length;
+      var moveCount = assignments.filter(function (a) {
+        return (a.folder_path || []).length > 0;
+      }).length;
+
+      root.innerHTML = '<div class="modal-backdrop"><div class="modal ai-sug-modal" role="dialog" aria-modal="true">' +
+        '<header class="modal-head"><div><h3>AI 整理预览</h3>' +
+        '<p class="modal-sub">新建 ' + newCount + ' 个归类，移动 ' + moveCount + ' 个会话。手动整理的会话已排除。</p></div>' +
+        '<button class="icon-btn" data-close aria-label="关闭">' +
+        '<svg class="ico" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"></path></svg></button></header>' +
+        '<div class="modal-body ai-sug-body">' +
+        '<div class="ai-sug-tools"><button class="btn btn-sm" data-sug-all>全选</button>' +
+        '<button class="btn btn-sm" data-sug-none>清空</button></div>' +
+        bodyHtml + '</div>' +
+        '<footer class="modal-foot"><span class="grow"></span>' +
+        '<button class="btn" data-discard>丢弃本次</button>' +
+        '<button class="btn" data-close>关闭</button>' +
+        '<button class="btn btn-primary" data-apply>应用选中</button></footer>' +
+        '</div></div>';
+
+      var backdrop = root.querySelector('.modal-backdrop');
+      function close() { root.innerHTML = ''; }
+      backdrop.addEventListener('click', function (e) { if (e.target === backdrop) close(); });
+      root.querySelectorAll('[data-close]').forEach(function (el) {
+        el.addEventListener('click', close);
+      });
+
+      function boxes() { return root.querySelectorAll('.ai-sug-box:not([disabled])'); }
+      root.querySelector('[data-sug-all]').addEventListener('click', function () {
+        boxes().forEach(function (b) { b.checked = true; });
+        syncGroupChecks();
+      });
+      root.querySelector('[data-sug-none]').addEventListener('click', function () {
+        boxes().forEach(function (b) { b.checked = false; });
+        syncGroupChecks();
+      });
+      function syncGroupChecks() {
+        root.querySelectorAll('.ai-sug-group').forEach(function (g) {
+          var all = g.querySelectorAll('.ai-sug-box:not([disabled])');
+          var checked = g.querySelectorAll('.ai-sug-box:not([disabled]):checked');
+          var mark = g.querySelector('.ai-sug-check');
+          if (mark) mark.classList.toggle('is-on', all.length > 0 && all.length === checked.length);
+        });
+      }
+      root.querySelectorAll('.ai-sug-check').forEach(function (el) {
+        el.addEventListener('click', function () {
+          var key = el.dataset.groupCheck;
+          var group = list.filter(function (g) { return g.path.join('/') === key; })[0];
+          if (!group) return;
+          var on = !el.classList.contains('is-on');
+          root.querySelectorAll('.ai-sug-box:not([disabled])').forEach(function (b) {
+            var item = group.items.filter(function (a) { return String(a.id) === b.dataset.sessionSug; })[0];
+            if (item) b.checked = on;
+          });
+          syncGroupChecks();
+        });
+      });
+      root.querySelectorAll('.ai-sug-box').forEach(function (b) {
+        b.addEventListener('change', syncGroupChecks);
+      });
+      syncGroupChecks();
+
+      root.querySelector('[data-discard]').addEventListener('click', function () {
+        api('/api/ai/suggestions/discard', {
+          method: 'POST', body: JSON.stringify({ job_id: jobID })
+        }).then(function () {
+          toast('已丢弃本次建议');
+          close();
+        }).catch(function (e) { toast(e.message, 'error'); });
+      });
+
+      root.querySelector('[data-apply]').addEventListener('click', function () {
+        var sessionIDs = [];
+        root.querySelectorAll('.ai-sug-box:checked').forEach(function (b) {
+          sessionIDs.push(parseInt(b.dataset.sessionSug, 10));
+        });
+        api('/api/ai/suggestions/apply', {
+          method: 'POST',
+          body: JSON.stringify({ job_id: jobID, session_ids: sessionIDs })
+        }).then(function (res) {
+          toast('已应用 ' + res.applied + ' 个会话');
+          close();
+          return Promise.all([loadFolders(), loadSessions()]);
+        }).catch(function (e) { toast(e.message, 'error'); });
+      });
+    });
+  }
+
+  function refreshAIStatus() {
+    var line = $('#aiStatusLine');
+    if (!line) return Promise.resolve();
+    var query = state.projectId ? '?project_id=' + state.projectId : '';
+    return api('/api/ai/status' + query).then(function (st) {
+      state.aiStatus = st;
+      if (st.probed === false) {
+        line.textContent = '待探测';
+        line.title = '首次使用 AI 整理时自动探测，也可在 AI 设置中手动探测';
+        return;
+      }
+      if (!st.available) {
+        line.textContent = '不可用';
+        line.title = st.error || '';
+        return;
+      }
+      var pending = st.pending || 0;
+      line.textContent = pending > 0 ? ('待生成 ' + pending) : (st.summary_count + ' 条');
+      line.title = '档位 ' + (st.profile || '—') + '，累计 $' + (st.cost_usd || 0).toFixed(3);
+    }).catch(function () {});
+  }
+
+  function aiSettingsDialog() {
+    Promise.all([
+      api('/api/ai/settings'),
+      api('/api/ai/status' + (state.projectId ? '?project_id=' + state.projectId : ''))
+    ]).then(function (res) {
+      var cfg = res[0] || {};
+      var st = res[1] || {};
+      var root = $('#modalRoot');
+      function sw(id, on) {
+        return '<button class="ai-switch' + (on ? ' is-on' : '') + '" id="' + id + '" role="switch" ' +
+          'aria-checked="' + (on ? 'true' : 'false') + '"><span></span></button>';
+      }
+      function row(label, control, hint) {
+        return '<div class="ai-form-row"><span class="ai-form-label">' + esc(label) + '</span>' +
+          '<div class="ai-form-control">' + control +
+          (hint ? '<span class="ai-form-hint">' + esc(hint) + '</span>' : '') + '</div></div>';
+      }
+      var profile = st.probed === false ? '待探测' : (st.available ? (st.profile || '—') : '不可用');
+
+      root.innerHTML = '<div class="modal-backdrop"><div class="modal ai-settings" role="dialog" aria-modal="true">' +
+        '<header class="modal-head"><div><h3>AI 设置</h3>' +
+        '<p class="modal-sub">通过本机 Claude Code 生成会话概要</p></div>' +
+        '<button class="icon-btn" data-close aria-label="关闭">' +
+        '<svg class="ico" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"></path></svg></button></header>' +
+        '<div class="modal-body ai-form">' +
+        row('启用 AI', sw('aiEnabled', cfg.enabled !== false), '生成会话概要，供列表与归类使用') +
+        row('模型', '<input class="ai-input wide" id="aiModel" value="' + esc(cfg.model || '') +
+          '" placeholder="留空使用默认模型">', 'CLI 可能被网关覆盖，实际模型以运行结果为准') +
+        row('能力档位', '<span class="ai-profile" id="aiProfile">' + esc(profile) + '</span>' +
+          '<button class="btn btn-sm" id="aiReprobe">重新探测</button>',
+          st.version ? 'CLI ' + st.version : '') +
+        row('最小消息数', '<input class="ai-input short" id="aiMinMessages" type="number" min="1" value="' +
+          (cfg.min_messages || 2) + '">', '少于该条数的会话不生成概要') +
+        row('字符预算', '<input class="ai-input short" id="aiMaxChars" type="number" min="300" value="' +
+          (cfg.max_chars || 1500) + '">', '采样上限，约 900 token') +
+        row('单轮入队上限', '<input class="ai-input short" id="aiLimit" type="number" min="1" value="' +
+          (cfg.auto_enqueue_limit || 50) + '">', '仅当前项目内生效') +
+        row('批量大小', '<input class="ai-input short" id="aiBatch" type="number" min="1" max="20" value="' +
+          (cfg.summary_batch_size || 10) + '">', '一次请求处理多少个会话；越大越快，但失败时拆成单条重试') +
+        row('附带结论段', sw('aiTail', cfg.include_conclusion_tail !== false),
+          '追加最后一条回答的结论，避免只得到问题清单') +
+        row('排除项目', '<input class="ai-input wide" id="aiExclude" value="' +
+          esc((cfg.exclude_projects || []).join('，')) + '" placeholder="项目路径，逗号分隔">',
+          '这些项目的会话不会被采样') +
+        '<div class="ai-usage">' +
+        '<span>已生成 <b>' + (st.summary_count || 0) + '</b></span>' +
+        '<span>失败 <b>' + (st.failed || 0) + '</b></span>' +
+        '<span>待生成 <b>' + (st.pending || 0) + '</b></span>' +
+        '<span>累计成本 <b>$' + (st.cost_usd || 0).toFixed(3) + '</b></span>' +
+        '</div></div>' +
+        '<footer class="modal-foot"><span class="grow"></span>' +
+        '<button class="btn" data-cancel>取消</button>' +
+        '<button class="btn btn-primary" data-save>保存</button></footer>' +
+        '</div></div>';
+
+      var backdrop = root.querySelector('.modal-backdrop');
+      function close() { root.innerHTML = ''; }
+      backdrop.addEventListener('click', function (e) { if (e.target === backdrop) close(); });
+      root.querySelector('[data-close]').addEventListener('click', close);
+      root.querySelector('[data-cancel]').addEventListener('click', close);
+      root.querySelectorAll('.ai-switch').forEach(function (el) {
+        el.addEventListener('click', function () {
+          el.classList.toggle('is-on');
+          el.setAttribute('aria-checked', el.classList.contains('is-on') ? 'true' : 'false');
+        });
+      });
+
+      root.querySelector('#aiReprobe').addEventListener('click', function () {
+        var btn = this;
+        btn.disabled = true;
+        btn.textContent = '探测中…';
+        api('/api/ai/probe', { method: 'POST' }).then(function (out) {
+          if (out.available) {
+            root.querySelector('#aiProfile').textContent = out.profile || '—';
+            toast('AI 可用：' + (out.profile || ''));
+          } else {
+            root.querySelector('#aiProfile').textContent = '不可用';
+            toast(out.error || 'AI 不可用', 'error');
+          }
+        }).catch(function (e) { toast(e.message, 'error'); }).then(function () {
+          btn.disabled = false;
+          btn.textContent = '重新探测';
+        });
+      });
+
+      root.querySelector('[data-save]').addEventListener('click', function () {
+        var payload = {
+          enabled: root.querySelector('#aiEnabled').classList.contains('is-on'),
+          model: root.querySelector('#aiModel').value.trim(),
+          min_messages: parseInt(root.querySelector('#aiMinMessages').value, 10) || 2,
+          max_chars: parseInt(root.querySelector('#aiMaxChars').value, 10) || 1500,
+          auto_enqueue_limit: parseInt(root.querySelector('#aiLimit').value, 10) || 50,
+          summary_batch_size: parseInt(root.querySelector('#aiBatch').value, 10) || 10,
+          include_conclusion_tail: root.querySelector('#aiTail').classList.contains('is-on'),
+          exclude_projects: root.querySelector('#aiExclude').value.split(/[，,]/)
+            .map(function (s) { return s.trim(); })
+            .filter(function (s) { return !!s; })
+        };
+        api('/api/ai/settings', { method: 'PATCH', body: JSON.stringify(payload) })
+          .then(function () {
+            toast('AI 设置已保存');
+            close();
+            refreshAIStatus();
+          })
+          .catch(function (e) { toast(e.message, 'error'); });
+      });
+    }).catch(function (e) { toast(e.message, 'error'); });
+  }
+
   function refreshStats() {
     return api('/api/health').then(function (h) {
       $('#statLine').textContent = '项目 ' + h.projects + '，会话 ' + h.sessions;
@@ -1701,6 +2178,7 @@
         $('#scanLine').textContent = '尚未扫描';
         setSync('未扫描', false);
       }
+      refreshAIStatus();
     }).catch(function () {});
   }
 
@@ -2668,6 +3146,32 @@
 
   /* ---------- 删除与回收站 ---------- */
 
+  // 只有「知道了」的提示弹窗，用于展示无法继续的原因。
+  function infoDialog(opts) {
+    return new Promise(function (resolve) {
+      var root = $('#modalRoot');
+      root.innerHTML = '<div class="modal-backdrop"><div class="modal" role="dialog" aria-modal="true">' +
+        '<header class="modal-head"><div><h3>' + esc(opts.title) + '</h3></div>' +
+        '<button class="icon-btn" data-close aria-label="关闭">' +
+        '<svg class="ico" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"></path></svg></button></header>' +
+        '<div class="modal-body"><p class="dialog-text">' + esc(opts.message) + '</p></div>' +
+        '<footer class="modal-foot"><span class="grow"></span>' +
+        '<button class="btn btn-primary" data-ok>知道了</button></footer>' +
+        '</div></div>';
+      var backdrop = root.querySelector('.modal-backdrop');
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        root.innerHTML = '';
+        resolve(true);
+      }
+      root.querySelector('[data-ok]').addEventListener('click', finish);
+      root.querySelector('[data-close]').addEventListener('click', finish);
+      backdrop.addEventListener('click', function (e) { if (e.target === backdrop) finish(); });
+    });
+  }
+
   function confirmDialog(opts) {
     return new Promise(function (resolve) {
       var root = $('#modalRoot');
@@ -2762,6 +3266,69 @@
     if (new URLSearchParams(location.search).get('noevents') === '1') return;
     var source = new EventSource('/api/events');
     var timer = null;
+    var aiTimer = null;
+    var aiPollTimer = null;
+    var aiRefreshPending = false;
+
+    function refreshAIView() {
+      if (document.hidden) {
+        aiRefreshPending = true;
+        return;
+      }
+      var scroll = $('#listBody').scrollTop;
+      loadSessions(true).then(function () {
+        $('#listBody').scrollTop = scroll;
+      }).catch(function () {});
+      // 概要生成完成时刷新详情卡片，保留阅读位置。
+      if (!state.sessionId) return;
+      var threadScroll = $('#thread').scrollTop;
+      api('/api/sessions/' + encodeURIComponent(state.sessionId)).then(function (detail) {
+        if (!detail || state.sessionId !== detail.session.id) return;
+        state.detail = detail;
+        renderDetail(detail);
+        $('#thread').scrollTop = threadScroll;
+      }).catch(function () {});
+    }
+
+    // SSE 事件之外再做短轮询，直到任务结束。
+    // 避免最后一个事件被防抖合并或连接抖动时，列表徽章停在半完成状态。
+    function pollAIUntilDone() {
+      if (aiPollTimer) return;
+      var started = Date.now();
+      function tick() {
+        var query = state.projectId ? '?project_id=' + state.projectId : '';
+        api('/api/ai/status' + query).then(function (st) {
+          state.aiStatus = st;
+          refreshAIView();
+          var job = st.job;
+          var running = !!(job && (job.status === 'queued' || job.status === 'running'));
+          if (running && Date.now() - started < 10 * 60 * 1000) {
+            aiPollTimer = setTimeout(tick, 2500);
+          } else {
+            aiPollTimer = null;
+            // 任务结束后补一次，确保最后写入的会话也显示徽章。
+            setTimeout(refreshAIView, 1000);
+          }
+        }).catch(function () {
+          aiPollTimer = null;
+        });
+      }
+      tick();
+    }
+
+    source.addEventListener('ai', function () {
+      clearTimeout(aiTimer);
+      aiTimer = setTimeout(function () {
+        refreshAIView();
+        pollAIUntilDone();
+      }, 800);
+    });
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden || !aiRefreshPending) return;
+      aiRefreshPending = false;
+      refreshAIView();
+    });
     source.addEventListener('scan', function () {
       clearTimeout(timer);
       timer = setTimeout(function () {
@@ -3010,6 +3577,13 @@
         selectSession(family.dataset.family);
         return;
       }
+      var applyTitle = e.target.closest('[data-apply-title]');
+      if (applyTitle) {
+        e.preventDefault();
+        e.stopPropagation();
+        applySuggestedTitle(applyTitle.dataset.applyTitle, applyTitle.dataset.title);
+        return;
+      }
       var act = e.target.closest('[data-move-folder],[data-session-open],[data-session-rename],[data-session-compact],[data-session-branch],[data-session-fork],[data-session-project],[data-session-delete]');
       if (act) {
         e.preventDefault();
@@ -3054,6 +3628,8 @@
     });
 
     $('#btnSync').addEventListener('click', doSync);
+    $('#btnAITidy').addEventListener('click', aiTidy);
+    $('#btnAISettings').addEventListener('click', aiSettingsDialog);
     $('#btnToggleIndex').addEventListener('click', function (e) {
       e.stopPropagation();
       if (isNarrow()) {

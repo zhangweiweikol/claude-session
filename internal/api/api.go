@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"mime"
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	aisvc "claude-session/internal/ai"
 	"claude-session/internal/creator"
 	"claude-session/internal/model"
 	"claude-session/internal/opener"
@@ -35,6 +37,7 @@ type Server struct {
 	opener   *opener.Opener
 	creator  *creator.Creator
 	trash    *trash.Manager
+	ai       *aisvc.Service
 	web      fs.FS
 	syncMu   sync.Mutex
 	lastScan time.Time
@@ -47,9 +50,9 @@ type Server struct {
 	lastHook time.Time
 }
 
-func New(st *store.Store, sc *scanner.Scanner, op *opener.Opener, cr *creator.Creator, tr *trash.Manager, web fs.FS) *Server {
+func New(st *store.Store, sc *scanner.Scanner, op *opener.Opener, cr *creator.Creator, tr *trash.Manager, ai *aisvc.Service, web fs.FS) *Server {
 	return &Server{
-		store: st, scanner: sc, opener: op, creator: cr, trash: tr, web: web,
+		store: st, scanner: sc, opener: op, creator: cr, trash: tr, ai: ai, web: web,
 		subs: make(map[chan string]struct{}),
 	}
 }
@@ -82,6 +85,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/fork", s.forkSession)
 	mux.HandleFunc("POST /api/sessions/{id}/compact", s.compactSession)
 	mux.HandleFunc("POST /api/sessions/{id}/restore", s.restoreSession)
+	mux.HandleFunc("POST /api/ai/summarize", s.aiSummarize)
+	mux.HandleFunc("GET /api/ai/status", s.aiStatus)
+	mux.HandleFunc("POST /api/ai/probe", s.aiProbe)
+	mux.HandleFunc("GET /api/ai/settings", s.aiGetSettings)
+	mux.HandleFunc("PATCH /api/ai/settings", s.aiPatchSettings)
+	mux.HandleFunc("GET /api/ai/jobs/{id}", s.aiGetJob)
+	mux.HandleFunc("POST /api/ai/categorize", s.aiCategorize)
+	mux.HandleFunc("GET /api/ai/suggestions", s.aiSuggestions)
+	mux.HandleFunc("POST /api/ai/suggestions/apply", s.aiApplySuggestions)
+	mux.HandleFunc("POST /api/ai/suggestions/discard", s.aiDiscardSuggestions)
 	mux.HandleFunc("POST /api/sync", s.sync)
 	mux.HandleFunc("GET /api/fs/dirs", s.listDirs)
 	mux.HandleFunc("POST /api/hooks/refresh", s.hookRefresh)
@@ -563,11 +576,180 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		}
 		messages, truncated = nil, false
 	}
-	writeJSON(w, http.StatusOK, model.SessionDetail{
+	detail := model.SessionDetail{
 		Session:   sess,
 		Messages:  messages,
 		Truncated: truncated,
-	})
+	}
+	if a, found, err := s.store.GetAISummary(r.Context(), sess.ID); err == nil && found {
+		detail.AI = &a
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// aiSummarize 为当前项目或指定会话生成概要。缺省 project_id 时取最近活跃项目。
+func (s *Server) aiSummarize(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ProjectID int64    `json:"project_id"`
+		IDs       []string `json:"ids"`
+		Force     bool     `json:"force"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	projectID := body.ProjectID
+	if projectID <= 0 {
+		p, ok, err := s.store.LatestActiveProject(r.Context(), time.Now().Add(-10*time.Minute).Unix())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusUnprocessableEntity, "请先打开一个项目")
+			return
+		}
+		projectID = p.ID
+	}
+
+	var jobID string
+	var queued int
+	var err error
+	if len(body.IDs) > 0 {
+		jobID, queued, err = s.ai.EnqueueIDs(r.Context(), projectID, body.IDs, body.Force)
+	} else {
+		jobID, queued, err = s.ai.Enqueue(r.Context(), projectID, body.Force, true)
+	}
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID, "queued": queued})
+}
+
+func (s *Server) aiStatus(w http.ResponseWriter, r *http.Request) {
+	projectID, _ := pathQueryID(r, "project_id")
+	if projectID <= 0 {
+		if p, ok, _ := s.store.LatestActiveProject(r.Context(), time.Now().Add(-10*time.Minute).Unix()); ok {
+			projectID = p.ID
+		}
+	}
+	writeJSON(w, http.StatusOK, s.ai.Status(r.Context(), projectID))
+}
+
+func (s *Server) aiProbe(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	if err := s.ai.Probe(ctx); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"available": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.ai.Status(r.Context(), 0))
+}
+
+func (s *Server) aiCategorize(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ProjectID  int64 `json:"project_id"`
+		Reevaluate bool  `json:"reevaluate"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	projectID := body.ProjectID
+	if projectID <= 0 {
+		p, ok, err := s.store.LatestActiveProject(r.Context(), time.Now().Add(-10*time.Minute).Unix())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !ok {
+			writeErr(w, http.StatusUnprocessableEntity, "请先打开一个项目")
+			return
+		}
+		projectID = p.ID
+	}
+	jobID, total, reason, err := s.ai.Categorize(r.Context(), projectID, body.Reevaluate)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"job_id": jobID, "total": total, "reason": reason})
+}
+
+func (s *Server) aiSuggestions(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("job_id")
+	if jobID == "" {
+		writeErr(w, http.StatusBadRequest, "缺少 job_id")
+		return
+	}
+	out, err := s.ai.ListSuggestions(r.Context(), jobID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) aiApplySuggestions(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		JobID      string  `json:"job_id"`
+		FolderIDs  []int64 `json:"folder_ids"`
+		SessionIDs []int64 `json:"session_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.JobID == "" {
+		writeErr(w, http.StatusBadRequest, "参数不合法")
+		return
+	}
+	applied, err := s.ai.ApplySuggestions(r.Context(), body.JobID, body.FolderIDs, body.SessionIDs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied": applied})
+}
+
+func (s *Server) aiDiscardSuggestions(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.JobID == "" {
+		writeErr(w, http.StatusBadRequest, "参数不合法")
+		return
+	}
+	if err := s.ai.DiscardSuggestions(r.Context(), body.JobID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) aiGetSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, aisvc.LoadSettings(r.Context(), s.store))
+}
+
+func (s *Server) aiPatchSettings(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取请求失败")
+		return
+	}
+	cfg, err := aisvc.ParseSettingsPatch(aisvc.LoadSettings(r.Context(), s.store), raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := aisvc.SaveSettings(r.Context(), s.store, cfg); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.ai.ApplyModel(cfg.Model)
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s *Server) aiGetJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.store.GetAIJob(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
 }
 
 // sessionAncestors 返回从根到父会话的链路，用于详情页血缘导航。
@@ -1198,7 +1380,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	ch := make(chan string, 4)
+	ch := make(chan string, 16)
 	s.subMu.Lock()
 	s.subs[ch] = struct{}{}
 	s.subMu.Unlock()
@@ -1381,6 +1563,11 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) NotifyScan() {
 	s.broadcast("scan")
+}
+
+// NotifyAI 通知前端刷新 AI 进度。
+func (s *Server) NotifyAI() {
+	s.broadcast("ai")
 }
 
 func (s *Server) SetScanState(t time.Time, res scanner.Result) {

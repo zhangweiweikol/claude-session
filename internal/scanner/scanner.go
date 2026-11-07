@@ -71,6 +71,7 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	res := Result{}
 	seen := make(map[string]int64) // 会话 ID -> 已处理文件的最新 mtime
 	projects := make(map[string]bool)
+	needFTSBackfill := false
 
 	entries, err := os.ReadDir(s.projectsDir)
 	if err != nil {
@@ -187,6 +188,8 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 			}
 			if err := s.store.IndexSession(ctx, id, sess.Title, sess.LastPrompt, m.Content); err != nil {
 				res.Errors = appendError(res.Errors, fmt.Sprintf("%s: 建立全文索引失败: %v", id, err))
+			} else {
+				needFTSBackfill = true
 			}
 			seen[id] = info.ModTime().Unix()
 			res.Sessions++
@@ -199,6 +202,12 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	}
 	if err := s.store.MarkMissing(ctx, present); err != nil {
 		return res, err
+	}
+	// 重建或新增索引后回填已有概要，保证搜索能命中摘要文本。
+	if needFTSBackfill {
+		if err := s.store.BackfillFTSSummary(ctx); err != nil {
+			res.Errors = appendError(res.Errors, "回填概要索引失败: "+err.Error())
+		}
 	}
 	res.Sessions = len(present)
 	res.Projects = len(projects)

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	aisvc "claude-session/internal/ai"
 	"claude-session/internal/api"
 	"claude-session/internal/creator"
 	"claude-session/internal/opener"
@@ -55,7 +56,24 @@ func main() {
 	op := opener.New(sessionsDir)
 	cr := creator.New(*projectsDir, op.ClaudePath())
 	tr := trash.New(filepath.Join(home, ".claude-session", "trash"))
-	server := api.New(st, sc, op, cr, tr, web.FS)
+
+	// AI 摘要通过本机 Claude Code 生成，临时目录固定，避免污染项目扫描。
+	aiWorkDir := filepath.Join(filepath.Dir(*dbPath), ".ai-tmp")
+	gen := aisvc.NewCLIGenerator(op.ClaudePath(), "", aiWorkDir)
+	var server *api.Server
+	aiCfg := aisvc.LoadSettings(context.Background(), st)
+	gen.SetModel(aiCfg.Model)
+	aiService := aisvc.New(st, gen, func(string) {
+		if server != nil {
+			server.NotifyAI()
+		}
+	})
+	server = api.New(st, sc, op, cr, tr, aiService, web.FS)
+	aiService.Start()
+
+	if !gen.Available() {
+		log.Printf("未找到 claude 可执行文件，AI 功能不可用")
+	}
 
 	// 首次启用全文索引时，强制重新解析已有会话。
 	if n, err := st.CountFTS(context.Background()); err == nil && n == 0 {

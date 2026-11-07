@@ -43,6 +43,9 @@
           <path d="M13 2.8V5h-2.2"></path>
         </svg>
       </button>
+      <button class="icon-btn" id="btnAISettings" title="AI 设置" aria-label="AI 设置">
+        <svg class="ico" viewBox="0 0 16 16"><path d="M8 2.4l1.2 2.8 2.8 1.2-2.8 1.2L8 10.4 6.8 7.6 4 6.4l2.8-1.2z"></path><path d="M12.4 10.2l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z"></path></svg>
+      </button>
       <button class="icon-btn" id="btnTheme" title="切换到深色主题" aria-label="切换到深色主题"></button>
       <button class="btn btn-primary" id="btnNewSession">
         <svg class="ico ico-sm" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6"></path></svg>
@@ -100,6 +103,7 @@
 
       <div class="side-foot">
         <div class="storage-row"><span>本地索引</span><span id="statLine" class="mono">—</span></div>
+        <div class="storage-row"><span>AI 概要</span><span id="aiStatusLine" class="mono">—</span></div>
         <div class="foot-row"><span class="tiny" id="scanLine">尚未扫描</span></div>
       </div>
     </aside>
@@ -119,6 +123,7 @@
             <button data-view="tree">谱系</button>
           </div>
           <div class="list-tools-right">
+            <button class="btn btn-sm btn-ai" id="btnAITidy" title="为当前项目生成概要">AI 整理</button>
             <button class="btn btn-sm btn-danger-ghost" id="btnEmptyTrash" hidden>清空回收站</button>
             <select class="sort-select" id="sortSelect" aria-label="排序方式">
               <option value="recent">最近活动</option>
