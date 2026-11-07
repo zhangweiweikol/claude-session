@@ -22,3 +22,6 @@ Thumbs.db
 # 本地环境配置
 .env
 *.local.json
+
+# 本地设计文档与设计静态页（不推送 Gitea / GitHub）
+/docs-design/
