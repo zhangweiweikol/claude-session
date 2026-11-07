@@ -28,10 +28,24 @@ jobs:
         shell: pwsh
         run: ./scripts/build-release.ps1 -Version ${{ github.ref_name }} -AppName session-deck
 
+      - name: Extract release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\].*?(?=^## \[|\z)"
+          $match = [regex]::Match($content, $pattern)
+          if ($match.Success) {
+            $notes = ($match.Value -replace '(?m)^## \[[^\]]+\][^\r\n]*\r?\n', '').Trim()
+          } else {
+            $notes = "See CHANGELOG.md for details."
+          }
+          $notes | Set-Content dist/RELEASE_NOTES.md -Encoding utf8
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: dist/RELEASE_NOTES.md
           files: |
             dist/*.zip
             dist/SHA256SUMS
-          generate_release_notes: true
