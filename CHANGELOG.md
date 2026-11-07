@@ -7,6 +7,8 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-11-07
+
 ### 新增
 
 - 通过本机 Claude Code CLI 的 print 模式生成会话概要，输出由 JSON Schema 约束，自动探测 `bare` / `lean` / `plain` 三档能力
@@ -48,5 +50,6 @@
 - 中英文 README、截图与演示 GIF
 - 发布打包脚本与按 tag 发布的 GitHub Actions 工作流
 
-[未发布]: https://github.com/zhangweiweikol/claude-session/compare/v0.1.0...HEAD
+[未发布]: https://github.com/zhangweiweikol/claude-session/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zhangweiweikol/claude-session/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zhangweiweikol/claude-session/releases/tag/v0.1.0
