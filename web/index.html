@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F4F5F0">
+<script>
+  try {
+    document.documentElement.dataset.theme = localStorage.getItem('sd.theme') === 'dark' ? 'dark' : 'light';
+  } catch (e) {
+    document.documentElement.dataset.theme = 'light';
+  }
+</script>
+<title>CC会话管理</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <button class="icon-btn top-index-btn" id="btnToggleIndex" title="收起索引" aria-label="收起索引" aria-expanded="true">
+      <svg class="ico" viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"></path></svg>
+    </button>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg class="ico" viewBox="0 0 1024 1024"><path d="M229.12 665.472l183.04-102.72 3.2-8.96-3.2-4.928h-8.832l-30.72-1.856-104.704-2.816-90.752-3.776-87.936-4.736-22.144-4.672-20.8-27.328 2.176-13.696 18.56-12.416 26.688 2.304 59.008 3.968 88.32 6.144 64.128 3.84 95.04 9.856h15.104l2.112-6.144-5.184-3.776-4.032-3.776-91.52-61.952-98.944-65.472-51.84-37.76-28.16-19.008-14.08-17.92-6.144-39.168 25.472-27.968 34.176 2.304 8.768 2.368 34.624 26.624 74.048 57.28 96.64 71.104 14.208 11.776 5.632-3.968 0.704-2.816-6.336-10.688-52.544-94.912-56.128-96.64-24.96-40-6.656-24a114.88 114.88 0 0 1-4.032-28.288l29.056-39.296 16-5.248 38.656 5.248 16.256 14.08 24.064 54.912 38.912 86.464 60.288 117.568 17.728 34.88 9.408 32.32 3.52 9.856h6.144v-5.696l4.992-66.176 9.216-81.28 8.896-104.576 3.136-29.504 14.592-35.328 28.992-19.072 22.656 10.88 18.624 26.496-2.56 17.28-11.136 71.808-21.76 112.64-14.08 75.328h8.256l9.408-9.344 38.208-50.688 64.064-80.064 28.352-31.808 32.96-35.072 21.248-16.768h40.064l29.44 43.84-13.184 45.248-41.216 52.288-34.24 44.288-49.024 65.92-30.72 52.8 2.88 4.288 7.232-0.768 110.848-23.552 59.84-10.88 71.424-12.16 32.32 15.04 3.52 15.296-12.8 31.36-76.352 18.816-89.6 17.92-133.44 31.552-1.6 1.152 1.92 2.368 60.032 5.696 25.728 1.344h62.912l117.184 8.768 30.72 20.288 18.368 24.768-3.072 18.88-47.168 24.064-63.68-15.104-148.544-35.328-50.88-12.8h-7.04v4.288l42.368 41.408 77.824 70.272 97.28 90.368 4.928 22.4-12.48 17.728-13.184-1.92-85.568-64.32-33.024-28.928-74.752-62.912h-4.992v6.592l17.28 25.216 90.88 136.576 4.736 41.92-6.592 13.696-23.616 8.256-25.92-4.736-53.248-74.688-54.912-84.032-44.352-75.456-5.376 3.136-26.24 281.472-12.16 14.336-28.288 10.88-23.552-17.92-12.48-28.928 12.48-57.28 15.104-74.688 12.224-59.392 11.136-73.728 6.592-24.512-0.448-1.6-5.44 0.64-55.68 76.416-84.544 114.24-67.008 71.616-16 6.336-27.84-14.336 2.56-25.728 15.616-22.848 92.672-117.76 55.872-73.024 36.096-42.176-0.256-6.144h-2.176l-246.144 159.744-43.776 5.632-18.944-17.664 2.368-28.928 8.96-9.472 74.048-50.88-0.256 0.256 0.192-0.064z" fill="#D97757"></path></svg>
+      </span>
+      <span class="brand-name">CC会话管理</span>
+    </div>
+
+    <div class="search">
+      <span class="search-slash" aria-hidden="true">/</span>
+      <input id="search" type="search" placeholder="搜索会话、prompt 或项目" aria-label="搜索会话">
+      <kbd>CTRL K</kbd>
+    </div>
+
+    <div class="top-actions">
+      <span class="sync" id="syncState"><span class="sync-dot"></span><span id="syncText">读取中</span></span>
+      <button class="icon-btn" id="btnSync" title="重新扫描" aria-label="重新扫描">
+        <svg class="ico" viewBox="0 0 16 16">
+          <path d="M13 8a5 5 0 1 1-1.6-3.7"></path>
+          <path d="M13 2.8V5h-2.2"></path>
+        </svg>
+      </button>
+      <button class="icon-btn" id="btnTheme" title="切换到深色主题" aria-label="切换到深色主题"></button>
+      <button class="btn btn-primary" id="btnNewSession">
+        <svg class="ico ico-sm" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6"></path></svg>
+        新建会话
+      </button>
+    </div>
+  </header>
+
+  <div class="workspace">
+
+    <aside class="sidebar">
+      <div class="side-block side-projects">
+        <div class="side-head" id="projectsHead">
+          <span class="side-title">
+            <svg class="head-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"></path></svg>
+            项目
+          </span>
+          <div class="side-head-actions">
+            <button class="icon-btn sm" id="btnProjectSearch" title="搜索项目（Ctrl+P）" aria-label="搜索项目">
+              <svg class="ico ico-sm" viewBox="0 0 16 16"><circle cx="6.8" cy="6.8" r="4.2"></circle><path d="M10 10l3 3"></path></svg>
+            </button>
+            <button class="icon-btn sm" id="btnAddProject" title="添加项目" aria-label="添加项目">
+              <svg class="ico ico-sm" viewBox="0 0 16 16"><path d="M8 3.2v9.6M3.2 8h9.6"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="project-search" id="projectSearch" hidden>
+          <input id="projectQuery" type="search" placeholder="搜索项目名称或路径" aria-label="搜索项目">
+        </div>
+        <div id="projectList" class="project-list"></div>
+      </div>
+
+      <div class="splitter splitter-h" id="projectsSplitter" role="separator" aria-orientation="horizontal" tabindex="0" title="拖动调整项目区高度"></div>
+
+      <div class="side-block side-grow">
+        <div class="side-head" id="foldersHead">
+          <span class="side-title">
+            <svg class="head-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4"></path></svg>
+            归类
+          </span>
+          <div class="side-head-actions">
+            <button class="icon-btn sm" id="btnFolderSearch" title="搜索归类" aria-label="搜索归类">
+              <svg class="ico ico-sm" viewBox="0 0 16 16"><circle cx="6.8" cy="6.8" r="4.2"></circle><path d="M10 10l3 3"></path></svg>
+            </button>
+            <button class="icon-btn sm" id="btnAddFolder" title="新建归类" aria-label="新建归类">
+              <svg class="ico ico-sm" viewBox="0 0 16 16"><path d="M8 3.2v9.6M3.2 8h9.6"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="folder-search" id="folderSearch" hidden>
+          <input id="folderQuery" type="search" placeholder="搜索归类名称" aria-label="搜索归类">
+        </div>
+        <div id="folderTree" class="folder-tree"></div>
+      </div>
+
+      <div class="side-foot">
+        <div class="storage-row"><span>本地索引</span><span id="statLine" class="mono">—</span></div>
+        <div class="foot-row"><span class="tiny" id="scanLine">尚未扫描</span></div>
+      </div>
+    </aside>
+
+    <div class="splitter splitter-v" data-resize="sidebar" role="separator" aria-orientation="vertical" tabindex="0" title="拖动调整项目栏宽度"></div>
+
+    <section class="list-pane">
+      <div class="pane-head">
+        <div class="pane-title">
+          <span class="pane-title-main" id="listSub">选择左侧项目</span>
+          <div class="crumb" id="listCrumb"></div>
+          <span class="pane-count" id="listCount"></span>
+        </div>
+        <div class="list-tools">
+          <div class="segmented view-switch" id="viewSwitch" role="group" aria-label="列表视图">
+            <button data-view="time" class="is-on">时间</button>
+            <button data-view="tree">谱系</button>
+          </div>
+          <div class="list-tools-right">
+            <button class="btn btn-sm btn-danger-ghost" id="btnEmptyTrash" hidden>清空回收站</button>
+            <select class="sort-select" id="sortSelect" aria-label="排序方式">
+              <option value="recent">最近活动</option>
+              <option value="messages">消息数</option>
+              <option value="title">标题</option>
+            </select>
+            <button class="btn btn-sm" id="btnSelectMode">多选</button>
+          </div>
+        </div>
+      </div>
+      <div class="bulk-bar" id="bulkBar" hidden>
+        <span id="bulkCount">已选 0 项</span>
+        <button class="link" data-bulk="all">全选</button>
+        <button class="link" data-bulk="none">清空</button>
+        <span class="grow"></span>
+        <button class="btn btn-sm" id="bulkMove" disabled>加入归类</button>
+        <button class="btn btn-danger btn-sm" id="bulkDelete" disabled>删除</button>
+      </div>
+      <div id="listBody" class="list-body"></div>
+    </section>
+
+    <div class="splitter splitter-v" data-resize="list" role="separator" aria-orientation="vertical" tabindex="0" title="拖动调整列表宽度"></div>
+
+    <main class="detail-pane">
+      <div id="detailHead" class="detail-head is-hidden"></div>
+      <div id="thread" class="thread"></div>
+      <div id="composer" class="composer" hidden></div>
+    </main>
+
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

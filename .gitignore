@@ -1,0 +1,24 @@
+# 构建产物
+/bin/
+/dist/
+*.exe
+
+# 运行时数据
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# 临时文件与日志
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# IDE
+/.idea/
+/.vscode/
+
+# 本地环境配置
+.env
+*.local.json
