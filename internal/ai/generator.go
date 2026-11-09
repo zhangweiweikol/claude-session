@@ -123,6 +123,7 @@ func (g *CLIGenerator) version(ctx context.Context) string {
 	if ext := strings.ToLower(filepath.Ext(g.bin)); ext == ".cmd" || ext == ".bat" {
 		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", g.bin, "--version")
 	}
+	hideConsole(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -169,6 +170,7 @@ func (g *CLIGenerator) Generate(ctx context.Context, req Request) (Result, error
 	} else {
 		cmd = exec.CommandContext(ctx, g.bin, args...)
 	}
+	hideConsole(cmd)
 	if g.workDir != "" {
 		_ = os.MkdirAll(g.workDir, 0o755)
 		cmd.Dir = g.workDir

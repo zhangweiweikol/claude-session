@@ -153,6 +153,7 @@ func (c *Creator) Compact(ctx context.Context, cwd, sessionID string) error {
 	} else {
 		cmd = exec.CommandContext(ctx, c.claudePath, args...)
 	}
+	hideConsole(cmd)
 	cmd.Dir = cwd
 
 	var stdout, stderr strings.Builder
@@ -193,6 +194,7 @@ func (c *Creator) CreateCLI(ctx context.Context, project model.Project, firstMes
 	} else {
 		cmd = exec.CommandContext(ctx, c.claudePath, args...)
 	}
+	hideConsole(cmd)
 	cmd.Dir = project.Cwd
 	cmd.Stdin = strings.NewReader(firstMessage)
 
