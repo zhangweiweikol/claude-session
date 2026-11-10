@@ -23,7 +23,7 @@ Built with Go, SQLite, and vanilla front-end code. Ships as a single process and
 - **Lineage view**: parses `forkedFrom` and shows fork relationships, a family tree, fork points, and the full ancestry chain
 - **Session actions**: resume, rename, compact, branch, fork, bulk delete, and trash restore
 - **AI summaries**: generated with your local Claude Code, shown in the list and on the detail page, including suggested titles
-- **AI tidy-up**: suggests project-level groups for review and apply; sessions grouped by hand are never touched
+- **AI tidy-up**: suggests project-level groups for review and apply; sessions grouped by hand are never touched. A fork/branch lineage (including multi-level descendants) always lands in one group, and child sessions follow an already-grouped parent
 - **Live refresh**: Claude Code hooks trigger incremental scans, SSE pushes updates, and a 30-second scan acts as a fallback
 - **Local first**: jsonl is the source of truth, deleting the database does not affect Claude Code; listens on localhost only and validates the Origin header
 
@@ -78,10 +78,10 @@ go build -o bin/session-deck-debug.exe ./cmd/server
 
 - **Summary**: the detail page shows goals, key actions, conclusions, and topic tags with empty / loading / error / success states; retry or regenerate at any time. The list shows the AI summary first, with highlighted search hits
 - **Suggested title**: shown when a session has no custom title and adoptable from either the detail page or the list
-- **AI tidy-up**: fills in missing summaries, generates grouping suggestions, then opens a preview. Groups can be new nested groups or existing ones; sessions with confidence below 0.6 are unchecked by default, and the run can be discarded
+- **AI tidy-up**: fills in missing summaries, generates grouping suggestions, then opens a preview. Groups can be new nested groups or existing ones; sessions with confidence below 0.6 are unchecked by default, and the run can be discarded. Summaries run 4-way parallel and grouping 3-way parallel, the button shows `summary / grouping x/y` progress, and a manual run handles up to 200 pending sessions
 - **Forked sessions**: a fork with fewer than 3 new messages inherits its parent's summary; otherwise only content after the fork point is sampled
 - **Sampling and privacy**: the first 8 and last 4 meaningful prompts plus the conclusion tail, with a 1,500-character budget. Low-information replies are skipped and secrets (`sk-`, `ghp_`, `AKIA`, `Bearer`, `password`, etc.) are redacted
-- **Invocation and cost**: `claude -p --output-format json --no-session-persistence --tools ""` with JSON Schema constrained output and automatic `bare` / `lean` / `plain` probing. 10 sessions per batch by default, failed batches retried one by one; the settings panel shows usage and cumulative cost
+- **Invocation and cost**: `claude -p --output-format json --no-session-persistence --tools ""` with JSON Schema constrained output and automatic `bare` / `lean` / `plain` probing. 15 sessions per batch by default, failed batches retried one by one; the settings panel shows usage and cumulative cost
 - **Settings**: enablement, model, capability probing, minimum messages, character budget, enqueue limit, batch size, conclusion tail, and excluded projects
 
 ### Opening a terminal

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +17,10 @@ import (
 )
 
 type fakeGenerator struct {
+	mu    sync.Mutex
 	calls int
+	last  Request
+	gate  func(ctx context.Context, req Request)
 	reply func(req Request) (Result, error)
 }
 
@@ -24,8 +28,24 @@ func (f *fakeGenerator) Name() string { return "fake" }
 func (f *fakeGenerator) Probe(ctx context.Context) (Profile, string, error) {
 	return ProfileBare, "test", nil
 }
+func (f *fakeGenerator) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+func (f *fakeGenerator) lastRequest() Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
+}
 func (f *fakeGenerator) Generate(ctx context.Context, req Request) (Result, error) {
+	f.mu.Lock()
 	f.calls++
+	f.last = req
+	f.mu.Unlock()
+	if f.gate != nil {
+		f.gate(ctx, req)
+	}
 	if f.reply != nil {
 		return f.reply(req)
 	}
@@ -259,8 +279,8 @@ func TestProcessBatchUsesSingleCall(t *testing.T) {
 
 	svc.processBatch(summaryTask{jobID: jobID, sessions: sessions, force: true})
 
-	if gen.calls != 1 {
-		t.Fatalf("3 个会话应只调用一次模型，实际 %d", gen.calls)
+	if gen.callCount() != 1 {
+		t.Fatalf("3 个会话应只调用一次模型，实际 %d", gen.callCount())
 	}
 	for _, sess := range sessions {
 		a, found, _ := st.GetAISummary(ctx, sess.ID)
@@ -280,7 +300,7 @@ func TestProcessBatchRetriesMissingItems(t *testing.T) {
 
 	var gen *fakeGenerator
 	gen = &fakeGenerator{reply: func(req Request) (Result, error) {
-		if gen.calls == 1 {
+		if gen.callCount() == 1 {
 			return Result{
 				Structured: json.RawMessage(`{"items":[
 					{"session_id":"miss-1","summary":"摘要一","topics":["a"],"title":"标题一","confidence":0.9,"drift":0},
@@ -302,8 +322,8 @@ func TestProcessBatchRetriesMissingItems(t *testing.T) {
 
 	svc.processBatch(summaryTask{jobID: jobID, sessions: sessions, force: true})
 
-	if gen.calls != 2 {
-		t.Fatalf("批量缺项应触发一次单条重试，实际调用 %d 次", gen.calls)
+	if gen.callCount() != 2 {
+		t.Fatalf("批量缺项应触发一次单条重试，实际调用 %d 次", gen.callCount())
 	}
 	missing, found, _ := st.GetAISummary(ctx, "miss-3")
 	if !found || missing.Summary != "补生成" {
@@ -554,5 +574,269 @@ func TestPathNormalize(t *testing.T) {
 	}
 	if pathKey([]string{"后端", "存储"}) != pathKey([]string{" 后端 ", "存储"}) {
 		t.Error("路径归一化后应相等")
+	}
+}
+
+func TestApplySuggestionsUnifiesLineage(t *testing.T) {
+	svc, st, ctx, pid := newAIService(t)
+	addSession(t, st, ctx, pid, "parent")
+	if err := st.UpsertSession(ctx, model.Session{
+		ID: "child", ProjectID: pid, ParentID: "parent", Title: "child",
+		FilePath: filepath.Join(t.TempDir(), "child.jsonl"), MessageCount: 2, State: "ok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := st.CreateFolder(ctx, pid, "已有", nil, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSessionFolder(ctx, "parent", &existing.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	jobID := "job-lineage"
+	if err := st.CreateAIJob(ctx, model.AIJob{ID: jobID, Kind: "categorize", ProjectID: pid, Status: "done", Total: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateFolderSuggestions(ctx, []store.FolderSuggestion{{JobID: jobID, Name: "新类"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSessionSuggestions(ctx, []store.SessionSuggestion{
+		{JobID: jobID, SessionID: "child", NewFolder: "新类", Action: "new_folder", Confidence: 0.9},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := svc.ApplySuggestions(ctx, jobID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("applied = %d, want 1", applied)
+	}
+	fid, found, err := st.SessionFolder(ctx, "child")
+	if err != nil || !found || fid == nil || *fid != existing.ID {
+		t.Fatalf("子会话应跟随父会话归入已有归类, got %v found=%v err=%v", fid, found, err)
+	}
+	folders, _ := st.ListFolders(ctx, pid)
+	if len(folders) != 1 {
+		t.Errorf("不应创建新归类, got %+v", folders)
+	}
+}
+
+func TestApplySuggestionsManualChildAnchorsParent(t *testing.T) {
+	svc, st, ctx, pid := newAIService(t)
+	addSession(t, st, ctx, pid, "parent")
+	if err := st.UpsertSession(ctx, model.Session{
+		ID: "child", ProjectID: pid, ParentID: "parent", Title: "child",
+		FilePath: filepath.Join(t.TempDir(), "child.jsonl"), MessageCount: 2, State: "ok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manual, err := st.CreateFolder(ctx, pid, "手动类", nil, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSessionFolder(ctx, "child", &manual.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	jobID := "job-manual-anchor"
+	if err := st.CreateAIJob(ctx, model.AIJob{ID: jobID, Kind: "categorize", ProjectID: pid, Status: "done", Total: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateFolderSuggestions(ctx, []store.FolderSuggestion{{JobID: jobID, Name: "新类"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateSessionSuggestions(ctx, []store.SessionSuggestion{
+		{JobID: jobID, SessionID: "parent", NewFolder: "新类", Action: "new_folder", Confidence: 0.9},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.ApplySuggestions(ctx, jobID, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	fid, _, err := st.SessionFolder(ctx, "parent")
+	if err != nil || fid == nil || *fid != manual.ID {
+		t.Fatalf("父会话应跟随手动归类的子会话, got %v err=%v", fid, err)
+	}
+	childFID, _, _ := st.SessionFolder(ctx, "child")
+	if childFID == nil || *childFID != manual.ID {
+		t.Fatalf("手动归类不应被修改, got %v", childFID)
+	}
+}
+
+func TestDropUnusedFolders(t *testing.T) {
+	folders := []FolderSuggestionPayload{
+		{Name: "保留"},
+		{Name: "空类"},
+		{Name: "父"},
+		{Name: "子", ParentName: "父"},
+	}
+	assignments := []AssignmentPayload{
+		{NewFolder: "保留"},
+		{NewFolder: "子"},
+	}
+	got := dropUnusedFolders(folders, assignments)
+	names := map[string]bool{}
+	for _, f := range got {
+		names[f.Name] = true
+	}
+	if !names["保留"] || !names["父"] || !names["子"] {
+		t.Errorf("应保留被引用的归类及其父级, got %+v", got)
+	}
+	if names["空类"] {
+		t.Errorf("空归类应被移除, got %+v", got)
+	}
+}
+
+func addSummary(t *testing.T, st *store.Store, ctx context.Context, id string) {
+	t.Helper()
+	if err := st.UpsertAISummary(ctx, model.AISummary{
+		SessionID: id, Summary: "摘要-" + id, Status: "ok", SourceMtime: 1, SourceSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProcessCategorizeSharesBatchAcrossLineageGroups(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "ai.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	pid, err := st.UpsertProject(ctx, t.TempDir(), "dir", "proj", time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addSession(t, st, ctx, pid, "parent")
+	if err := st.UpsertSession(ctx, model.Session{
+		ID: "child", ProjectID: pid, ParentID: "parent", Title: "child",
+		FilePath: filepath.Join(t.TempDir(), "child.jsonl"), MessageCount: 2, State: "ok",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"solo1", "solo2", "solo3"} {
+		addSession(t, st, ctx, pid, id)
+	}
+	for _, id := range []string{"parent", "child", "solo1", "solo2", "solo3"} {
+		addSummary(t, st, ctx, id)
+	}
+
+	gen := &fakeGenerator{reply: func(req Request) (Result, error) {
+		return Result{
+			Structured: json.RawMessage(`{
+  "folders":[
+    {"name":"谱系类","parent_ref":0,"parent_name":"","description":"","confidence":0.9},
+    {"name":"共同主题","parent_ref":0,"parent_name":"","description":"","confidence":0.9}
+  ],
+  "assignments":[
+    {"session_id":"parent","ref":0,"new_folder":"谱系类","confidence":0.9,"reason":""},
+    {"session_id":"child","ref":0,"new_folder":"谱系类","confidence":0.9,"reason":""},
+    {"session_id":"solo1","ref":0,"new_folder":"共同主题","confidence":0.9,"reason":""},
+    {"session_id":"solo2","ref":0,"new_folder":"共同主题","confidence":0.9,"reason":""},
+    {"session_id":"solo3","ref":0,"new_folder":"","confidence":0.5,"reason":""}
+  ]
+}`), Model: "fake", Profile: ProfileBare,
+		}, nil
+	}}
+	svc := New(st, gen, func(string) {})
+
+	sessions, err := st.CategorizeCandidates(ctx, pid, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 5 {
+		t.Fatalf("candidates = %d, want 5", len(sessions))
+	}
+
+	jobID := "job-batch"
+	if err := st.CreateAIJob(ctx, model.AIJob{
+		ID: jobID, Kind: "categorize", ProjectID: pid, Status: "queued", Total: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.processCategorize(jobID, pid, sessions, model.AISettings{})
+
+	if gen.callCount() != 1 {
+		t.Fatalf("无谱系会话应和谱系组共享批次, calls = %d", gen.callCount())
+	}
+	for _, id := range []string{"parent", "child", "solo1", "solo2", "solo3"} {
+		if !strings.Contains(gen.lastRequest().User, "- "+id+" |") {
+			t.Errorf("prompt 缺少会话 %s", id)
+		}
+	}
+	if n := strings.Count(gen.lastRequest().User, "| 谱系组："); n != 2 {
+		t.Errorf("谱系组标签出现 %d 次, want 2", n)
+	}
+
+	list, err := st.ListSessionSuggestions(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]store.SessionSuggestion{}
+	for _, a := range list {
+		byID[a.SessionID] = a
+	}
+	if byID["solo1"].NewFolder != "共同主题" || byID["solo2"].NewFolder != "共同主题" {
+		t.Errorf("无谱系会话应能合并到同一新归类, got %+v", byID)
+	}
+	if byID["solo3"].Action != "keep" {
+		t.Errorf("无法归类的会话应生成 keep 建议, got %+v", byID["solo3"])
+	}
+}
+
+func TestPruneNewFoldersBelowThreshold(t *testing.T) {
+	folders := []FolderSuggestionPayload{
+		{Name: "单例"},
+		{Name: "父"},
+		{Name: "子", ParentName: "父"},
+	}
+	assignments := []AssignmentPayload{
+		{SessionID: "s1", NewFolder: "单例"},
+		{SessionID: "s2", NewFolder: "父"},
+		{SessionID: "s3", NewFolder: "父"},
+		{SessionID: "s4", NewFolder: "子"},
+	}
+	gotFolders, gotAssignments := pruneNewFoldersBelowThreshold(folders, assignments)
+
+	names := map[string]bool{}
+	for _, f := range gotFolders {
+		names[f.Name] = true
+	}
+	if names["单例"] || names["子"] {
+		t.Errorf("不足 2 个会话的归类应被移除, got %+v", gotFolders)
+	}
+	if !names["父"] {
+		t.Errorf("达标的归类应保留, got %+v", gotFolders)
+	}
+	byID := map[string]AssignmentPayload{}
+	for _, a := range gotAssignments {
+		byID[a.SessionID] = a
+	}
+	if byID["s1"].NewFolder != "" || byID["s1"].Reason == "" {
+		t.Errorf("单例会话应降级为 keep 并写明原因, got %+v", byID["s1"])
+	}
+	if byID["s4"].NewFolder != "" {
+		t.Errorf("单会话子归类应降级为 keep, got %+v", byID["s4"])
+	}
+	if byID["s2"].NewFolder != "父" {
+		t.Errorf("达标归类不应被改动, got %+v", byID["s2"])
+	}
+}
+
+func TestFillMissingAssignments(t *testing.T) {
+	sessions := []model.Session{{ID: "a"}, {ID: "b"}}
+	got := fillMissingAssignments(sessions, []AssignmentPayload{{SessionID: "a", NewFolder: "x"}})
+	if len(got) != 2 {
+		t.Fatalf("应补一条 keep 建议, got %+v", got)
+	}
+	for _, a := range got {
+		if a.SessionID == "b" && (!strings.Contains(a.Reason, "保持未归类") || a.NewFolder != "") {
+			t.Errorf("遗漏会话的 keep 建议不正确: %+v", a)
+		}
 	}
 }

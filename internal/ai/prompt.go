@@ -255,6 +255,7 @@ type CategorizeItem struct {
 	Summary      string
 	Topics       []string
 	ParentFolder []string
+	LineageGroup string
 	Drift        float64
 }
 
@@ -370,6 +371,10 @@ func buildCategorizeRequest(projectName string, folders []FolderNode, items []Ca
 			b.WriteString(" | 父会话归类：")
 			b.WriteString(strings.Join(item.ParentFolder, " / "))
 		}
+		if item.LineageGroup != "" {
+			b.WriteString(" | 谱系组：")
+			b.WriteString(item.LineageGroup)
+		}
 		if item.Drift > 0 {
 			b.WriteString(" | 分叉后主题偏移：")
 			b.WriteString(fmt.Sprintf("%.2f", item.Drift))
@@ -385,11 +390,13 @@ func buildCategorizeRequest(projectName string, folders []FolderNode, items []Ca
 	b.WriteString("3) 完全没有合适的已有归类时，可以自行创建一级和二级：\n")
 	b.WriteString("   一级：parent_ref=0 且 parent_name 留空；二级：parent_name 填本批新建的一级名称。\n")
 	b.WriteString("4) 新建一级归类最多 9 个，层级最多 2 层。只有确实超过 9 个时才需要合并到「其他」；未超过时不要创建名为「其他」的归类。\n")
-	b.WriteString("5) 归类名 2~8 字名词短语，本批新建的名称必须唯一；新建归类至少要有 2 个会话，否则不要新建。\n")
+	b.WriteString("5) 归类名 2~8 字名词短语，本批新建的名称必须唯一；新建归类至少要有 2 个会话。\n")
+	b.WriteString("   某个主题只有 1 个会话时，复用最接近的已有归类，或保持未归类（ref=0 且 new_folder 留空），不要为它单独新建归类。\n")
 	b.WriteString("6) folders 按创建顺序排列，父级必须先于引用它的子级出现。\n")
 	b.WriteString("7) 无法判断时 ref=0 且 new_folder 留空，表示保持未归类。\n")
 	b.WriteString("8) 用户自定义标题表示明确的归类意图，优先服从；prompt 截断出的标题只作参考。\n")
-	b.WriteString("9) 同一父会话的派生会话优先与父会话同归类；分叉后主题明显不同才单独归类。\n")
+	b.WriteString("9) 带相同「谱系组」标签的会话必须分到同一个归类；即使分叉后主题不同，也必须同归类。\n")
+	b.WriteString("   没有标签的独立会话不受此限制，可以按主题彼此合并，也可以与任意谱系组归入同一归类；不同谱系组之间没有必须分开的约束。\n")
 	b.WriteString("10) confidence：0~1，表示对该会话归类的把握。\n")
 
 	return Request{System: "你是会话归档助手。只输出 JSON，不要输出任何解释文字。", User: b.String(), Schema: categorizeSchema()}

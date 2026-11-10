@@ -34,7 +34,8 @@
     treeCollapsed: {},
     sessionIndex: {},
     childCount: {},
-    crumbExpanded: false
+    crumbExpanded: false,
+    aiBusy: {}
   };
   var savedLast = {
     project: Number(localStorage.getItem('sd.lastProject')) || 0,
@@ -265,6 +266,7 @@
     clearDetail();
     renderProjects();
     renderFolderTabs();
+    syncAITidyButton();
     return loadFolders().then(function () {
       // 记忆里的归类可能已被删除，回退到「已归类」。
       if (state.folderFilter.indexOf('f:') === 0 && !folderFilterValid(state.folderFilter)) {
@@ -1833,17 +1835,30 @@
 
   /* ---------- AI 概要 ---------- */
 
-  function pollAIJob(jobID, timeoutMs) {
+  function pollAIJob(jobID, opts) {
+    opts = opts || {};
     var start = Date.now();
+    var lastChange = Date.now();
+    var lastProcessed = -1;
     return new Promise(function (resolve, reject) {
       function tick() {
         api('/api/ai/jobs/' + encodeURIComponent(jobID)).then(function (job) {
+          if (opts.onProgress) opts.onProgress(job);
+          var processed = (job.done || 0) + (job.failed || 0);
+          if (processed !== lastProcessed) {
+            lastProcessed = processed;
+            lastChange = Date.now();
+          }
           if (job.status === 'done' || job.status === 'failed' || job.status === 'canceled') {
             resolve(job);
             return;
           }
-          if (Date.now() - start > (timeoutMs || 10 * 60 * 1000)) {
+          if (Date.now() - start > (opts.timeoutMs || 10 * 60 * 1000)) {
             reject(new Error('任务超时，请稍后重试'));
+            return;
+          }
+          if (Date.now() - lastChange > (opts.stallMs || 15 * 60 * 1000)) {
+            reject(new Error('任务长时间没有进展，请稍后重试'));
             return;
           }
           setTimeout(tick, 1500);
@@ -1853,11 +1868,55 @@
     });
   }
 
+  // AI 整理按钮按项目记录忙碌状态，切换项目时显示对应项目的进度。
+  function syncAITidyButton() {
+    var btn = $('#btnAITidy');
+    if (!btn) return;
+    var busy = state.projectId ? state.aiBusy[state.projectId] : null;
+    if (!busy) {
+      btn.disabled = false;
+      btn.textContent = 'AI 整理';
+      return;
+    }
+    btn.disabled = true;
+    var label = busy.phase === 'summary' ? '生成概要' : '整理归类';
+    var total = busy.total || 0;
+    var processed = Math.min(total, (busy.done || 0) + (busy.failed || 0));
+    btn.textContent = total ? label + ' ' + processed + '/' + total : label + '…';
+  }
+
+  function setAIBusy(projectID, phase, total) {
+    if (!projectID) return;
+    state.aiBusy[projectID] = { phase: phase, done: 0, failed: 0, total: total || 0 };
+    syncAITidyButton();
+  }
+
+  function updateAIProgress(projectID, job) {
+    var busy = state.aiBusy[projectID];
+    if (!busy || !job) return;
+    busy.done = job.done || 0;
+    busy.failed = job.failed || 0;
+    if (job.total) busy.total = job.total;
+    if (state.projectId === projectID) syncAITidyButton();
+  }
+
+  function clearAIBusy(projectID) {
+    if (!projectID) return;
+    delete state.aiBusy[projectID];
+    syncAITidyButton();
+  }
+
+  function projectDisplayName(projectID) {
+    var project = state.projects.filter(function (p) { return p.id === projectID; })[0];
+    return project ? project.name : '#' + projectID;
+  }
+
   // AI 整理：先生成缺失概要，再做项目级归类，最后打开预览。
   function aiTidy() {
     if (!state.projectId) { toast('请先选择一个项目', 'error'); return; }
-    var btn = $('#btnAITidy');
-    if (btn.disabled) return;
+    var projectID = state.projectId;
+    if (state.aiBusy[projectID]) return;
+    var projectName = projectDisplayName(projectID);
 
     var hasAIFolders = (state.folders || []).some(function (f) { return f.source === 'ai'; });
     var ask = hasAIFolders
@@ -1868,44 +1927,61 @@
       })
       : Promise.resolve(false);
 
-    btn.disabled = true;
-    btn.textContent = '生成概要…';
-
     ask.then(function (reevaluate) {
+      setAIBusy(projectID, 'summary');
       return api('/api/ai/summarize', {
         method: 'POST',
-        body: JSON.stringify({ project_id: state.projectId })
+        body: JSON.stringify({ project_id: projectID })
       }).then(function (res) {
         if (!res.job_id) throw new Error('入队失败');
-        return pollAIJob(res.job_id).then(function () { return reevaluate; });
+        setAIBusy(projectID, 'summary', res.queued || 0);
+        return pollAIJob(res.job_id, {
+          timeoutMs: 60 * 60 * 1000,
+          stallMs: 12 * 60 * 1000,
+          onProgress: function (job) { updateAIProgress(projectID, job); }
+        }).then(function (job) {
+          if (job.status === 'failed') throw new Error(job.error || '概要生成失败');
+          if (job.failed > 0) {
+            toast('有 ' + job.failed + ' 个会话概要生成失败，将继续整理已有概要的会话', 'error');
+          }
+          return reevaluate;
+        });
       });
     }).then(function (reevaluate) {
-      btn.textContent = '整理归类…';
+      setAIBusy(projectID, 'categorize');
       return api('/api/ai/categorize', {
         method: 'POST',
-        body: JSON.stringify({ project_id: state.projectId, reevaluate: !!reevaluate })
-      });
-    }).then(function (res) {
-      if (!res.job_id) throw new Error('入队失败');
-      return pollAIJob(res.job_id).then(function (job) {
-        refreshAIStatus();
-        if (!job.total) {
-          return infoDialog({
-            title: '没有可整理的会话',
-            message: res.reason || '当前项目没有可整理的会话。'
-          });
-        }
-        return openSuggestionDialog(res.job_id);
+        body: JSON.stringify({ project_id: projectID, reevaluate: !!reevaluate })
+      }).then(function (res) {
+        if (!res.job_id) throw new Error('入队失败');
+        setAIBusy(projectID, 'categorize', res.total || 0);
+        return pollAIJob(res.job_id, {
+          timeoutMs: 30 * 60 * 1000,
+          stallMs: 6 * 60 * 1000,
+          onProgress: function (job) { updateAIProgress(projectID, job); }
+        }).then(function (job) {
+          refreshAIStatus();
+          if (job.status === 'failed') throw new Error(job.error || '归类失败');
+          if (job.failed > 0) {
+            toast('有 ' + job.failed + ' 个会话未能完成归类，已保留其余结果', 'error');
+          }
+          if (!job.total) {
+            return infoDialog({
+              title: '没有可整理的会话',
+              message: res.reason || '当前项目没有可整理的会话。'
+            });
+          }
+          return openSuggestionDialog(res.job_id, projectName);
+        });
       });
     }).catch(function (e) {
       toast(e.message, 'error');
     }).then(function () {
-      btn.disabled = false;
-      btn.textContent = 'AI 整理';
+      clearAIBusy(projectID);
     });
   }
 
-  function openSuggestionDialog(jobID) {
+  function openSuggestionDialog(jobID, projectName) {
     return api('/api/ai/suggestions?job_id=' + encodeURIComponent(jobID)).then(function (data) {
       if (data.job && data.job.status === 'failed') {
         return infoDialog({
@@ -1922,6 +1998,9 @@
         var path = (f.parent_path || []).concat([f.name]);
         var key = path.join('/');
         groups[key] = { path: path, folder: f, items: [] };
+      });
+      var kept = assignments.filter(function (a) {
+        return !(a.folder_path || []).length;
       });
       assignments.forEach(function (a) {
         var path = a.folder_path || [];
@@ -1977,8 +2056,23 @@
         return '<div class="ai-sug-group">' + header + desc + '<div class="ai-sug-items">' + items + '</div></div>';
       }).join('');
 
-      if (!bodyHtml) {
-        bodyHtml = '<p class="dialog-text">没有可应用的归类建议。</p>';
+      var keptHtml = '';
+      if (kept.length) {
+        keptHtml = '<div class="ai-sug-group">' +
+          '<div class="ai-sug-head"><span class="ai-sug-path">保持未归类</span>' +
+          '<span class="ai-sug-count">' + kept.length + ' 个会话</span></div>' +
+          '<div class="ai-sug-items">' +
+          kept.map(function (a) {
+            return '<div class="ai-sug-item is-low"><span class="ai-sug-body">' +
+              '<span class="ai-sug-title">' + esc(sessionTitle(a.session_id)) + '</span>' +
+              '<span class="ai-sug-reason">' + esc(a.reason || '') + '</span></span></div>';
+          }).join('') +
+          '</div></div>';
+      }
+
+      var contentHtml = bodyHtml + keptHtml;
+      if (!contentHtml) {
+        contentHtml = '<p class="dialog-text">没有可应用的归类建议。</p>';
       }
 
       var newCount = folders.length;
@@ -1987,14 +2081,17 @@
       }).length;
 
       root.innerHTML = '<div class="modal-backdrop"><div class="modal ai-sug-modal" role="dialog" aria-modal="true">' +
-        '<header class="modal-head"><div><h3>AI 整理预览</h3>' +
-        '<p class="modal-sub">新建 ' + newCount + ' 个归类，移动 ' + moveCount + ' 个会话。手动整理的会话已排除。</p></div>' +
+        '<header class="modal-head"><div><h3>AI 整理预览' +
+        (projectName ? ' · ' + esc(projectName) : '') + '</h3>' +
+        '<p class="modal-sub">新建 ' + newCount + ' 个归类，移动 ' + moveCount + ' 个会话。' +
+        (kept.length ? '另有 ' + kept.length + ' 个会话保持未归类。' : '') +
+        '手动整理的会话已排除。</p></div>' +
         '<button class="icon-btn" data-close aria-label="关闭">' +
         '<svg class="ico" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"></path></svg></button></header>' +
         '<div class="modal-body ai-sug-body">' +
         '<div class="ai-sug-tools"><button class="btn btn-sm" data-sug-all>全选</button>' +
         '<button class="btn btn-sm" data-sug-none>清空</button></div>' +
-        bodyHtml + '</div>' +
+        contentHtml + '</div>' +
         '<footer class="modal-foot"><span class="grow"></span>' +
         '<button class="btn" data-discard>丢弃本次</button>' +
         '<button class="btn" data-close>关闭</button>' +
@@ -2129,7 +2226,7 @@
         row('单轮入队上限', '<input class="ai-input short" id="aiLimit" type="number" min="1" value="' +
           (cfg.auto_enqueue_limit || 50) + '">', '仅当前项目内生效') +
         row('批量大小', '<input class="ai-input short" id="aiBatch" type="number" min="1" max="20" value="' +
-          (cfg.summary_batch_size || 10) + '">', '一次请求处理多少个会话；越大越快，但失败时拆成单条重试') +
+          (cfg.summary_batch_size || 15) + '">', '一次请求处理多少个会话；越大越快，但失败时拆成单条重试') +
         row('附带结论段', sw('aiTail', cfg.include_conclusion_tail !== false),
           '追加最后一条回答的结论，避免只得到问题清单') +
         row('排除项目', '<input class="ai-input wide" id="aiExclude" value="' +
@@ -2183,7 +2280,7 @@
           min_messages: parseInt(root.querySelector('#aiMinMessages').value, 10) || 2,
           max_chars: parseInt(root.querySelector('#aiMaxChars').value, 10) || 1500,
           auto_enqueue_limit: parseInt(root.querySelector('#aiLimit').value, 10) || 50,
-          summary_batch_size: parseInt(root.querySelector('#aiBatch').value, 10) || 10,
+          summary_batch_size: parseInt(root.querySelector('#aiBatch').value, 10) || 15,
           include_conclusion_tail: root.querySelector('#aiTail').classList.contains('is-on'),
           exclude_projects: root.querySelector('#aiExclude').value.split(/[，,]/)
             .map(function (s) { return s.trim(); })
@@ -2296,6 +2393,7 @@
       api('/api/projects/' + id, { method: 'DELETE' }).then(function (res) {
         toast('项目已删除' + (res.sessions ? '，已移走 ' + res.sessions + ' 个会话' : ''));
         try { localStorage.removeItem('sd.folderFilter.' + id); } catch (e) { /* 隐私模式 */ }
+        delete state.aiBusy[id];
         if (state.projectId === id) {
           state.projectId = null;
           state.sessionId = null;

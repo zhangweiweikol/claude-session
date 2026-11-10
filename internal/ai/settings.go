@@ -18,7 +18,7 @@ func defaultSettings() model.AISettings {
 		MaxChars:              1500,
 		IncludeConclusionTail: true,
 		AutoEnqueueLimit:      50,
-		SummaryBatchSize:      10,
+		SummaryBatchSize:      15,
 		AutoCategorize:        false,
 		ExcludeProjects:       []string{},
 	}
@@ -40,7 +40,7 @@ func LoadSettings(ctx context.Context, st *store.Store) model.AISettings {
 		cfg.AutoEnqueueLimit = 50
 	}
 	if cfg.SummaryBatchSize <= 0 {
-		cfg.SummaryBatchSize = 10
+		cfg.SummaryBatchSize = 15
 	}
 	if cfg.SummaryBatchSize > 20 {
 		cfg.SummaryBatchSize = 20
@@ -62,7 +62,7 @@ func SaveSettings(ctx context.Context, st *store.Store, cfg model.AISettings) er
 		cfg.AutoEnqueueLimit = 50
 	}
 	if cfg.SummaryBatchSize <= 0 {
-		cfg.SummaryBatchSize = 10
+		cfg.SummaryBatchSize = 15
 	}
 	if cfg.SummaryBatchSize > 20 {
 		cfg.SummaryBatchSize = 20

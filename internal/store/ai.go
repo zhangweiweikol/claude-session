@@ -618,6 +618,46 @@ WHERE COALESCE(s.display_project_id, s.project_id) = ?`, projectID)
 	return out, rows.Err()
 }
 
+// SessionLineage 描述会话的谱系与归类状态，用于按谱系统一归类。
+type SessionLineage struct {
+	ParentID     string
+	FolderID     *int64
+	FolderSource string
+	State        string
+	DeletedAt    int64
+	HasSummary   bool
+}
+
+// ListSessionLineage 返回项目内全部会话的谱系与归类状态。
+func (s *Store) ListSessionLineage(ctx context.Context, projectID int64) (map[string]SessionLineage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT s.id, s.parent_id, s.folder_id, s.folder_source, s.state, s.deleted_at,
+       EXISTS(SELECT 1 FROM session_ai a WHERE a.session_id = s.id AND a.status = 'ok' AND a.summary <> '')
+FROM sessions s
+WHERE COALESCE(s.display_project_id, s.project_id) = ?`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]SessionLineage)
+	for rows.Next() {
+		var id string
+		var item SessionLineage
+		var folder sql.NullInt64
+		if err := rows.Scan(&id, &item.ParentID, &folder, &item.FolderSource,
+			&item.State, &item.DeletedAt, &item.HasSummary); err != nil {
+			return nil, err
+		}
+		if folder.Valid {
+			v := folder.Int64
+			item.FolderID = &v
+		}
+		out[id] = item
+	}
+	return out, rows.Err()
+}
+
 // SetSessionFolderAI 写入 AI 建议的归类，并标记来源，便于后续整理覆盖。
 func (s *Store) SetSessionFolderAI(ctx context.Context, sessionID string, folderID int64) error {
 	_, err := s.db.ExecContext(ctx,

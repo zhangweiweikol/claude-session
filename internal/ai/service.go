@@ -80,7 +80,7 @@ func (s *Service) Start() {
 	if err := s.st.ResetActiveJobs(s.ctx); err != nil {
 		log.Printf("清理中断的 AI 任务失败: %v", err)
 	}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < defaultSummaryWorkers; i++ {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -161,6 +161,15 @@ func (s *Service) setModel(name string) {
 	s.mu.Unlock()
 }
 
+// summaryEnqueueLimit 返回单轮待生成概要的会话上限：手动整理不受自动整理的 50 条限制。
+func summaryEnqueueLimit(cfg model.AISettings, manual bool) int {
+	limit := cfg.AutoEnqueueLimit
+	if manual && limit < manualEnqueueLimit {
+		limit = manualEnqueueLimit
+	}
+	return limit
+}
+
 // Enqueue 按项目入队待生成概要的会话。手动触发时跳过 60 秒写入保护。
 func (s *Service) Enqueue(ctx context.Context, projectID int64, force, manual bool) (string, int, error) {
 	if err := s.ensureProbed(ctx); err != nil {
@@ -183,7 +192,7 @@ func (s *Service) Enqueue(ctx context.Context, projectID int64, force, manual bo
 		return "", 0, errors.New("该项目已加入 AI 排除名单")
 	}
 
-	sessions, err := s.st.PendingSummarySessions(ctx, projectID, cfg.MinMessages, cfg.AutoEnqueueLimit, force, manual)
+	sessions, err := s.st.PendingSummarySessions(ctx, projectID, cfg.MinMessages, summaryEnqueueLimit(cfg, manual), force, manual)
 	if err != nil {
 		return "", 0, err
 	}
@@ -523,10 +532,26 @@ func (s *Service) failSummary(ctx context.Context, jobID, sessionID string, prev
 // --- 项目级归类 ---
 
 const (
-	categorizeBatch   = 40
-	maxFolderDepth    = 2
-	minFolderSessions = 2
+	categorizeBatch              = 40
+	defaultCategorizeConcurrency = 3
+	defaultSummaryWorkers        = 4
+	manualEnqueueLimit           = 200
+	maxFolderDepth               = 2
+	minFolderSessions            = 2
 )
+
+var (
+	categorizeBatchTimeout = 3 * time.Minute
+	categorizeMaxBudget    = 30 * time.Minute
+)
+
+// categorizeBatchResult 保存单个归类批次的模型结果，按批次下标写入，无需加锁。
+type categorizeBatchResult struct {
+	count       int
+	folders     []FolderSuggestionPayload
+	assignments map[string]lineageAssignment
+	err         error
+}
 
 // Categorize 为项目内未归类的会话生成归类建议。默认只产出建议，不落库。
 // 候选为空时返回原因，供前端展示。
@@ -552,6 +577,14 @@ func (s *Service) Categorize(ctx context.Context, projectID int64, reevaluate bo
 	sessions, err := s.st.CategorizeCandidates(ctx, projectID, reevaluate)
 	if err != nil {
 		return "", 0, "", err
+	}
+	// 补齐同谱系里其他可整理的会话，保证整条谱系一起参与归类。
+	if states, err := s.st.ListSessionLineage(ctx, projectID); err == nil {
+		if extraIDs := expandLineageCandidates(sessions, states, reevaluate); len(extraIDs) > 0 {
+			if extra, err := s.st.GetSessionsByIDs(ctx, extraIDs); err == nil {
+				sessions = append(sessions, extra...)
+			}
+		}
 	}
 	jobID := newID()
 	now := time.Now().Unix()
@@ -586,7 +619,8 @@ func (s *Service) emptyCategorizeReason(ctx context.Context, projectID int64, re
 }
 
 func (s *Service) processCategorize(jobID string, projectID int64, sessions []model.Session, cfg model.AISettings) {
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Minute)
+	// 准备阶段只做本地 DB 读取，不占用模型调用预算。
+	ctx, cancel := context.WithTimeout(s.ctx, 2*time.Minute)
 	defer cancel()
 	_ = s.st.MarkAIJobRunning(ctx, jobID)
 
@@ -603,28 +637,46 @@ func (s *Service) processCategorize(jobID string, projectID int64, sessions []mo
 	nodes, pathByID := folderNodes(folders)
 	folderMap, _ := s.st.SessionFolderMap(ctx, projectID)
 
+	states, err := s.st.ListSessionLineage(ctx, projectID)
+	if err != nil {
+		_ = s.st.FailAIJob(ctx, jobID, err.Error())
+		return
+	}
+	candidateSet := make(map[string]bool, len(sessions))
+	for _, sess := range sessions {
+		candidateSet[sess.ID] = true
+	}
+	lineageNodes := lineageNodesFrom(states, candidateSet)
+	for _, sess := range sessions {
+		if _, ok := lineageNodes[sess.ID]; !ok {
+			lineageNodes[sess.ID] = lineageNode{ID: sess.ID, ParentID: sess.ParentID, Candidate: true}
+		}
+	}
+	groups := buildLineageGroups(lineageNodes, candidateSet)
+
+	sessionByID := make(map[string]model.Session, len(sessions))
 	ids := make([]string, 0, len(sessions))
 	for _, sess := range sessions {
+		sessionByID[sess.ID] = sess
 		ids = append(ids, sess.ID)
 	}
 	summaries, _ := s.st.ListAISummaries(ctx, ids)
 
-	var allFolders []FolderSuggestionPayload
-	var allAssignments []AssignmentPayload
-	failed := 0
-	lastErr := ""
-
-	for start := 0; start < len(sessions); start += categorizeBatch {
-		end := start + categorizeBatch
-		if end > len(sessions) {
-			end = len(sessions)
-		}
-		items := make([]CategorizeItem, 0, end-start)
-		for _, sess := range sessions[start:end] {
+	// 多个谱系组共享批次；单元素组不单独成请求，也不标注谱系组。
+	packs, labels := planCategorizeBatches(groups, candidateSet, categorizeBatch)
+	var batches [][]CategorizeItem
+	for _, pack := range packs {
+		items := make([]CategorizeItem, 0, len(pack))
+		for _, id := range pack {
+			sess, ok := sessionByID[id]
+			if !ok {
+				continue
+			}
 			a := summaries[sess.ID]
 			item := CategorizeItem{
 				SessionID: sess.ID, Title: sess.Title, TitleSource: titleSource(sess),
 				Summary: a.Summary, Topics: a.Topics, Drift: a.Drift,
+				LineageGroup: labels[id],
 			}
 			if sess.ParentID != "" {
 				if fid, ok := folderMap[sess.ParentID]; ok && fid != nil {
@@ -633,26 +685,53 @@ func (s *Service) processCategorize(jobID string, projectID int64, sessions []mo
 			}
 			items = append(items, item)
 		}
+		if len(items) > 0 {
+			batches = append(batches, items)
+		}
+	}
 
-		res, err := s.gen.Generate(ctx, buildCategorizeRequest(project.Name, nodes, items))
-		if err != nil {
-			log.Printf("AI 归类失败 job=%s project=%d batch=%d-%d: %v", jobID, projectID, start, end, err)
-			lastErr = err.Error()
-			_ = s.st.UpdateAIJob(ctx, jobID, start, failed+len(items), "running", err.Error())
-			failed += len(items)
+	concurrency := defaultCategorizeConcurrency
+	if concurrency > len(batches) {
+		concurrency = len(batches)
+	}
+	genCtx, genCancel := context.WithTimeout(s.ctx, categorizeBudget(len(batches), concurrency))
+	defer genCancel()
+	results := s.runCategorizeBatches(genCtx, jobID, project.Name, nodes, batches, concurrency)
+
+	var allFolders []FolderSuggestionPayload
+	assignments := make(map[string]lineageAssignment)
+	failed := 0
+	lastErr := ""
+	for _, r := range results {
+		if r.err != nil {
+			failed += r.count
+			lastErr = r.err.Error()
 			continue
 		}
-		payload, err := parseCategorize(res)
-		if err != nil {
-			log.Printf("AI 归类结果解析失败 job=%s project=%d batch=%d-%d: %v", jobID, projectID, start, end, err)
-			lastErr = err.Error()
-			failed += len(items)
+		allFolders = append(allFolders, r.folders...)
+		for sid, a := range r.assignments {
+			assignments[sid] = a
+		}
+	}
+	allFolders = dedupeFolderSuggestions(allFolders)
+
+	// 同一谱系的会话收敛到同一个归类。
+	folderRef := make(map[int64]int, len(nodes))
+	for _, n := range nodes {
+		folderRef[n.ID] = n.Ref
+	}
+	applyLineageTargets(groups, lineageNodes, assignments, folderRef)
+
+	var allAssignments []AssignmentPayload
+	for _, sess := range sessions {
+		a, ok := assignments[sess.ID]
+		if !ok {
 			continue
 		}
-		allFolders = append(allFolders, payload.Folders...)
-		allAssignments = append(allAssignments, payload.Assignments...)
-		_ = s.st.UpdateAIJob(ctx, jobID, end, failed, "running", "")
-		s.broadcast("ai")
+		allAssignments = append(allAssignments, AssignmentPayload{
+			SessionID: sess.ID, Ref: a.Ref, NewFolder: a.NewFolder,
+			Confidence: a.Confidence, Reason: a.Reason,
+		})
 	}
 
 	if len(allFolders) > 0 || len(allAssignments) > 0 {
@@ -676,8 +755,17 @@ func (s *Service) processCategorize(jobID string, projectID int64, sessions []mo
 			}
 		}
 
+		// 谱系收敛后可能留下没有任何会话的新归类，先移除再限流。
+		allFolders = dropUnusedFolders(allFolders, allAssignments)
+
 		// 新建顶级归类最多 9 个，超出的合并到「其他」。
 		allFolders, allAssignments = capTopFolders(allFolders, allAssignments, nodes)
+
+		// 提前执行「新建归类至少 2 个会话」门槛，避免预览出现无法应用的条目。
+		allFolders, allAssignments = pruneNewFoldersBelowThreshold(allFolders, allAssignments)
+
+		// 模型完全遗漏的会话补一条保持未归类的建议，保证预览可见。
+		allAssignments = fillMissingAssignments(sessions, allAssignments)
 
 		refToID := make(map[int]int64, len(nodes))
 		for _, n := range nodes {
@@ -719,25 +807,246 @@ func (s *Service) processCategorize(jobID string, projectID int64, sessions []mo
 				Confidence: a.Confidence, Reason: a.Reason,
 			})
 		}
-		if err := s.st.CreateFolderSuggestions(ctx, fs); err != nil {
+		writeCtx, writeCancel := s.jobWriteContext()
+		if err := s.st.CreateFolderSuggestions(writeCtx, fs); err != nil {
 			log.Printf("写入归类建议失败: %v", err)
 		}
-		if err := s.st.CreateSessionSuggestions(ctx, ss); err != nil {
+		if err := s.st.CreateSessionSuggestions(writeCtx, ss); err != nil {
 			log.Printf("写入会话归类建议失败: %v", err)
 		}
+		writeCancel()
 	}
 
 	status := "done"
 	if failed >= len(sessions) && len(sessions) > 0 {
 		status = "failed"
 	}
-	_ = s.st.UpdateAIJob(ctx, jobID, len(sessions), failed, status, lastErr)
+	writeCtx, writeCancel := s.jobWriteContext()
+	_ = s.st.UpdateAIJob(writeCtx, jobID, len(sessions)-failed, failed, status, lastErr)
+	writeCancel()
 	if cfg.AutoCategorize && status == "done" {
-		if _, err := s.ApplySuggestions(ctx, jobID, nil, nil); err != nil {
+		// 自动应用可能创建归类、更新会话，使用不随整理预算取消的上下文。
+		if _, err := s.ApplySuggestions(context.WithoutCancel(s.ctx), jobID, nil, nil); err != nil {
 			log.Printf("自动应用归类失败: %v", err)
 		}
 	}
 	s.broadcast("ai")
+}
+
+// categorizeBudget 按批数和并发度估算总预算，避免固定超时切断后段批次。
+func categorizeBudget(batchCount, concurrency int) time.Duration {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	waves := (batchCount + concurrency - 1) / concurrency
+	budget := time.Duration(waves)*categorizeBatchTimeout + 2*time.Minute
+	if budget < 10*time.Minute {
+		budget = 10 * time.Minute
+	}
+	if budget > categorizeMaxBudget {
+		budget = categorizeMaxBudget
+	}
+	return budget
+}
+
+// jobWriteContext 用于总预算耗尽后仍能写入已完成批次的结果。
+func (s *Service) jobWriteContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(s.ctx), 30*time.Second)
+}
+
+// runCategorizeBatches 并发执行归类批次：只并发模型调用，进度和结果由主 goroutine 串行汇总。
+func (s *Service) runCategorizeBatches(ctx context.Context, jobID, projectName string, nodes []FolderNode, batches [][]CategorizeItem, concurrency int) []categorizeBatchResult {
+	results := make([]categorizeBatchResult, len(batches))
+	if len(batches) == 0 {
+		return results
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(batches) {
+		concurrency = len(batches)
+	}
+
+	sem := make(chan struct{}, concurrency)
+	doneCh := make(chan int, len(batches))
+	var wg sync.WaitGroup
+	for i, items := range batches {
+		wg.Add(1)
+		go func(i int, items []CategorizeItem) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					results[i].err = fmt.Errorf("归类批处理异常: %v", r)
+				}
+				doneCh <- i
+			}()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			results[i].count = len(items)
+			batchCtx, cancel := context.WithTimeout(ctx, categorizeBatchTimeout)
+			defer cancel()
+			res, err := s.gen.Generate(batchCtx, buildCategorizeRequest(projectName, nodes, items))
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			payload, err := parseCategorize(res)
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			results[i].folders = payload.Folders
+			assignments := make(map[string]lineageAssignment, len(payload.Assignments))
+			for _, a := range payload.Assignments {
+				if a.SessionID == "" {
+					continue
+				}
+				assignments[a.SessionID] = lineageAssignment{
+					Ref: a.Ref, NewFolder: a.NewFolder, Confidence: a.Confidence, Reason: a.Reason,
+				}
+			}
+			results[i].assignments = assignments
+		}(i, items)
+	}
+
+	done, failed := 0, 0
+	lastErr := ""
+	for range batches {
+		i := <-doneCh
+		r := results[i]
+		if r.err != nil {
+			failed += r.count
+			lastErr = r.err.Error()
+			log.Printf("AI 归类失败 job=%s batch=%d: %v", jobID, i, r.err)
+		} else {
+			done += r.count
+		}
+		writeCtx, cancel := s.jobWriteContext()
+		_ = s.st.UpdateAIJob(writeCtx, jobID, done, failed, "running", lastErr)
+		cancel()
+		s.broadcast("ai")
+	}
+	wg.Wait()
+	return results
+}
+
+// dedupeFolderSuggestions 去掉并发批次产生的同名同级归类。
+func dedupeFolderSuggestions(folders []FolderSuggestionPayload) []FolderSuggestionPayload {
+	seen := make(map[string]bool, len(folders))
+	out := make([]FolderSuggestionPayload, 0, len(folders))
+	for _, f := range folders {
+		key := normalizeName(f.Name) + "|" + normalizeName(f.ParentName) + "|" + fmt.Sprintf("%d", f.ParentRef)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out
+}
+
+// dropUnusedFolders 移除没有任何会话归属的新归类，保留仍被会话所在的子归类引用的父级。
+func dropUnusedFolders(folders []FolderSuggestionPayload, assignments []AssignmentPayload) []FolderSuggestionPayload {
+	used := make(map[string]bool, len(folders))
+	for _, a := range assignments {
+		if name := strings.TrimSpace(a.NewFolder); name != "" {
+			used[normalizeName(name)] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, f := range folders {
+			if f.ParentName == "" || !used[normalizeName(f.Name)] {
+				continue
+			}
+			parent := normalizeName(f.ParentName)
+			if !used[parent] {
+				used[parent] = true
+				changed = true
+			}
+		}
+	}
+
+	kept := make([]FolderSuggestionPayload, 0, len(folders))
+	for _, f := range folders {
+		if used[normalizeName(f.Name)] {
+			kept = append(kept, f)
+		}
+	}
+	return kept
+}
+
+// effectiveFolderCounts 计算新建归类的有效会话数：父级 = 自身 + 直接子级。
+func effectiveFolderCounts(folders []FolderSuggestionPayload, assignments []AssignmentPayload) map[string]int {
+	counts := make(map[string]int, len(folders))
+	for _, a := range assignments {
+		if name := strings.TrimSpace(a.NewFolder); name != "" {
+			counts[normalizeName(name)]++
+		}
+	}
+	effective := make(map[string]int, len(counts))
+	for k, v := range counts {
+		effective[k] = v
+	}
+	for _, f := range folders {
+		if strings.TrimSpace(f.ParentName) == "" {
+			continue
+		}
+		effective[normalizeName(f.ParentName)] += counts[normalizeName(f.Name)]
+	}
+	return effective
+}
+
+// pruneNewFoldersBelowThreshold 提前执行「新建归类至少 2 个会话」门槛：
+// 不足门槛的新归类被移除，对应会话改为保持未归类并写明原因。
+func pruneNewFoldersBelowThreshold(folders []FolderSuggestionPayload, assignments []AssignmentPayload) ([]FolderSuggestionPayload, []AssignmentPayload) {
+	effective := effectiveFolderCounts(folders, assignments)
+	blocked := make(map[string]bool)
+	for _, f := range folders {
+		key := normalizeName(f.Name)
+		if effective[key] < minFolderSessions {
+			blocked[key] = true
+		}
+	}
+	if len(blocked) == 0 {
+		return folders, assignments
+	}
+	for i := range assignments {
+		key := normalizeName(assignments[i].NewFolder)
+		if key == "" || !blocked[key] {
+			continue
+		}
+		note := fmt.Sprintf("该归类仅有 %d 个会话，未达到新建归类所需的 %d 个会话，保持未归类",
+			effective[key], minFolderSessions)
+		if assignments[i].Reason != "" {
+			assignments[i].Reason += "；" + note
+		} else {
+			assignments[i].Reason = note
+		}
+		assignments[i].Ref = 0
+		assignments[i].NewFolder = ""
+	}
+	return dropUnusedFolders(folders, assignments), assignments
+}
+
+// fillMissingAssignments 为模型完全遗漏的候选会话补 keep 建议，保证预览可见。
+func fillMissingAssignments(sessions []model.Session, assignments []AssignmentPayload) []AssignmentPayload {
+	seen := make(map[string]bool, len(assignments))
+	for _, a := range assignments {
+		seen[a.SessionID] = true
+	}
+	for _, sess := range sessions {
+		if seen[sess.ID] {
+			continue
+		}
+		assignments = append(assignments, AssignmentPayload{
+			SessionID: sess.ID,
+			Reason:    "模型未给出归类建议，保持未归类",
+		})
+	}
+	return assignments
 }
 
 // capTopFolders 限制新建的一级归类数量：保留会话数最多的 9 个，
@@ -974,6 +1283,62 @@ func (s *Service) ApplySuggestions(ctx context.Context, jobID string, folderIDs,
 	wantFolder := toSet(folderIDs)
 	wantSession := toSet(sessionIDs)
 
+	// 同一谱系的建议收敛到同一个归类；已应用和未勾选的会话不参与，但可作为锚点。
+	if states, err := s.st.ListSessionLineage(ctx, job.ProjectID); err == nil {
+		candidates := make(map[string]bool)
+		for _, a := range assignments {
+			if a.Applied {
+				continue
+			}
+			if len(wantSession) > 0 && !wantSession[a.ID] {
+				continue
+			}
+			candidates[a.SessionID] = true
+		}
+		if len(candidates) > 0 {
+			nodes := lineageNodesFrom(states, candidates)
+			groups := buildLineageGroups(nodes, candidates)
+			folderRef := make(map[int64]int, len(existing))
+			refToID := make(map[int]int64, len(existing))
+			for i, f := range existing {
+				folderRef[f.ID] = i + 1
+				refToID[i+1] = f.ID
+			}
+			bySession := make(map[string]lineageAssignment, len(assignments))
+			for _, a := range assignments {
+				if !candidates[a.SessionID] {
+					continue
+				}
+				la := lineageAssignment{NewFolder: a.NewFolder, Confidence: a.Confidence, Reason: a.Reason}
+				if a.FolderID > 0 {
+					if ref, ok := folderRef[a.FolderID]; ok {
+						la.Ref = ref
+						la.NewFolder = ""
+					}
+				}
+				bySession[a.SessionID] = la
+			}
+			applyLineageTargets(groups, nodes, bySession, folderRef)
+			for i := range assignments {
+				target, ok := bySession[assignments[i].SessionID]
+				if !ok {
+					continue
+				}
+				if target.Ref > 0 {
+					if fid, ok := refToID[target.Ref]; ok {
+						assignments[i].FolderID = fid
+						assignments[i].NewFolder = ""
+						assignments[i].FolderPath = nil
+					}
+				} else if target.NewFolder != "" {
+					assignments[i].FolderID = 0
+					assignments[i].NewFolder = target.NewFolder
+					assignments[i].FolderPath = nil
+				}
+			}
+		}
+	}
+
 	// 统计本批新建归类实际会绑定多少会话，用于「至少 2 个」门槛。
 	// 父级自身可能没有会话，但子级有，所以父级按「自身 + 子级」计算。
 	counts := make(map[string]int)
@@ -1049,6 +1414,7 @@ func (s *Service) ApplySuggestions(ctx context.Context, jobID string, folderIDs,
 	}
 
 	applied := 0
+	skipped := 0
 	var appliedSessionIDs []int64
 	for _, a := range assignments {
 		if a.Applied {
@@ -1073,6 +1439,9 @@ func (s *Service) ApplySuggestions(ctx context.Context, jobID string, folderIDs,
 			}
 		}
 		if !ok {
+			if a.FolderID > 0 || a.NewFolder != "" || len(a.FolderPath) > 0 {
+				skipped++
+			}
 			continue
 		}
 		if err := s.st.SetSessionFolderAI(ctx, a.SessionID, target); err != nil {
@@ -1082,6 +1451,9 @@ func (s *Service) ApplySuggestions(ctx context.Context, jobID string, folderIDs,
 		appliedSessionIDs = append(appliedSessionIDs, a.ID)
 	}
 
+	if skipped > 0 {
+		log.Printf("AI 归类应用跳过 %d 个会话：目标归类未创建或不存在", skipped)
+	}
 	_ = s.st.MarkFolderSuggestionsApplied(ctx, appliedFolderIDs)
 	_ = s.st.MarkSessionSuggestionsApplied(ctx, appliedSessionIDs)
 	s.broadcast("scan")

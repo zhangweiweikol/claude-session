@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -75,6 +76,7 @@ func kindOf(err error) Kind {
 
 // CLIGenerator 通过本机 Claude Code 的 print 模式生成内容。
 type CLIGenerator struct {
+	mu        sync.RWMutex
 	bin       string
 	model     string
 	workDir   string
@@ -90,7 +92,11 @@ func (g *CLIGenerator) Name() string { return "claude-cli" }
 
 func (g *CLIGenerator) Available() bool { return g != nil && g.bin != "" }
 
-func (g *CLIGenerator) SetModel(name string) { g.model = name }
+func (g *CLIGenerator) SetModel(name string) {
+	g.mu.Lock()
+	g.model = name
+	g.mu.Unlock()
+}
 
 // Probe 依次尝试 bare / lean / plain，返回第一个可用的档位与 CLI 版本。
 func (g *CLIGenerator) Probe(ctx context.Context) (Profile, string, error) {
@@ -99,7 +105,9 @@ func (g *CLIGenerator) Probe(ctx context.Context) (Profile, string, error) {
 	}
 	version := g.version(ctx)
 	for _, p := range []Profile{ProfileBare, ProfileLean, ProfilePlain} {
+		g.mu.Lock()
 		g.profile = p
+		g.mu.Unlock()
 		probeCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		_, err := g.Generate(probeCtx, Request{
 			System: "只输出 JSON",
@@ -110,7 +118,9 @@ func (g *CLIGenerator) Probe(ctx context.Context) (Profile, string, error) {
 		if err == nil {
 			return p, version, nil
 		}
+		g.mu.Lock()
 		g.lastError = err.Error()
+		g.mu.Unlock()
 		if kindOf(err) == KindAuth && p != ProfilePlain {
 			continue
 		}
@@ -135,7 +145,10 @@ func (g *CLIGenerator) Generate(ctx context.Context, req Request) (Result, error
 	if !g.Available() {
 		return Result{}, &Error{Kind: KindUnavailable, Msg: "未找到 claude 可执行文件"}
 	}
+	g.mu.RLock()
 	profile := g.profile
+	model := g.model
+	g.mu.RUnlock()
 	if profile == "" {
 		profile = ProfilePlain
 	}
@@ -159,8 +172,8 @@ func (g *CLIGenerator) Generate(ctx context.Context, req Request) (Result, error
 	if req.System != "" {
 		args = append(args, "--append-system-prompt", req.System)
 	}
-	if g.model != "" {
-		args = append(args, "--model", g.model)
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 
 	var cmd *exec.Cmd
