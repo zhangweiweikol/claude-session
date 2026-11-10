@@ -220,8 +220,29 @@
     }
   }
 
+  // 每个项目记住上次点击的归类；没有记录时用「已归类」。
+  function rememberedFilter(id) {
+    var saved = '';
+    try { saved = localStorage.getItem('sd.folderFilter.' + id) || ''; } catch (e) { /* 隐私模式 */ }
+    if (!validRememberedFilter(saved)) {
+      // 旧版只把最后一次点击存在 sd.lastFolder，属于最后打开的项目。
+      saved = savedLast.project === id ? savedLast.folder : '';
+    }
+    return validRememberedFilter(saved) ? saved : 'categorized';
+  }
+
+  function rememberFilter(id, filter) {
+    if (!id) return;
+    try { localStorage.setItem('sd.folderFilter.' + id, filter); } catch (e) { /* 隐私模式 */ }
+  }
+
+  function validRememberedFilter(filter) {
+    return filter === 'all' || filter === 'unfiled' || filter === 'categorized' || /^f:\d+$/.test(filter);
+  }
+
   function selectProject(id, fromUser) {
     if (state.projectId === id) return Promise.resolve();
+    var filter = rememberedFilter(id);
     localStorage.setItem('sd.lastProject', String(id));
     var sidebar = $('.sidebar');
     if (sidebar) sidebar.classList.remove('is-open');
@@ -231,8 +252,7 @@
       project.last_opened_at = Math.floor(Date.now() / 1000);
       api('/api/projects/' + id + '/touch', { method: 'POST' }).catch(function () {});
     }
-    // 用户切换项目时默认回到「已归类」；首次自动选中项目仍用「待归类」。
-    state.folderFilter = fromUser ? 'categorized' : 'unfiled';
+    state.folderFilter = filter;
     state.sessionId = null;
     state.query = '';
     state.expanded = {};
@@ -245,7 +265,16 @@
     clearDetail();
     renderProjects();
     renderFolderTabs();
-    return Promise.all([loadFolders(), loadSessions()]);
+    return loadFolders().then(function () {
+      // 记忆里的归类可能已被删除，回退到「已归类」。
+      if (state.folderFilter.indexOf('f:') === 0 && !folderFilterValid(state.folderFilter)) {
+        state.folderFilter = 'categorized';
+        rememberFilter(state.projectId, 'categorized');
+        renderFolders();
+        renderFolderTabs();
+      }
+      return loadSessions();
+    });
   }
 
   /* ---------- 归类 ---------- */
@@ -473,6 +502,8 @@
   function setFolderFilter(filter) {
     state.folderFilter = filter;
     localStorage.setItem('sd.lastFolder', filter);
+    // 回收站不作为项目默认归类，只记真实的归类选择。
+    if (filter !== 'trash') rememberFilter(state.projectId, filter);
     state.crumbExpanded = false;
     state.sessionId = null;
     initialHash = null;
@@ -673,6 +704,7 @@
             var fid = Number(state.folderFilter.slice(2));
             if (!state.folders.some(function (f) { return f.id === fid; })) {
               state.folderFilter = 'all';
+              rememberFilter(state.projectId, 'all');
             }
           }
           renderFolders();
@@ -2263,6 +2295,7 @@
       if (!ok) return;
       api('/api/projects/' + id, { method: 'DELETE' }).then(function (res) {
         toast('项目已删除' + (res.sessions ? '，已移走 ' + res.sessions + ' 个会话' : ''));
+        try { localStorage.removeItem('sd.folderFilter.' + id); } catch (e) { /* 隐私模式 */ }
         if (state.projectId === id) {
           state.projectId = null;
           state.sessionId = null;
@@ -3228,6 +3261,7 @@
     api('/api/sessions/' + encodeURIComponent(s.id) + '/restore', { method: 'POST' }).then(function () {
       toast('会话已还原');
       state.folderFilter = 'all';
+      rememberFilter(state.projectId, 'all');
       renderFolders();
       renderFolderTabs();
       return loadSessions(true).then(function () {
@@ -3765,20 +3799,12 @@
   }
 
   function restoreLastState() {
-    var chain = Promise.resolve();
-    if (savedLast.folder && savedLast.folder !== state.folderFilter && folderFilterValid(savedLast.folder)) {
-      state.folderFilter = savedLast.folder;
-      state.sessionId = null;
-      renderFolders();
-      renderFolderTabs();
-      chain = loadSessions();
-    }
-    if (initialHash) return chain;
-    return chain.then(function () {
-      if (!savedLast.session || state.sessionId === savedLast.session) return;
-      var exists = state.sessions.some(function (s) { return s.id === savedLast.session; });
-      if (exists) return selectSession(savedLast.session);
-    });
+    // 归类已由 selectProject 按项目记忆恢复，这里只补回上次打开的会话。
+    if (initialHash) return Promise.resolve();
+    if (!savedLast.session || state.sessionId === savedLast.session) return Promise.resolve();
+    var exists = state.sessions.some(function (s) { return s.id === savedLast.session; });
+    if (exists) return selectSession(savedLast.session);
+    return Promise.resolve();
   }
 
   function init() {
