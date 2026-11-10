@@ -362,3 +362,70 @@ func TestAutoDisplayKeepsFolder(t *testing.T) {
 		t.Errorf("folder lost after display reset: %v", got.FolderID)
 	}
 }
+
+func TestMergeProjectKeepsMetadata(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "merge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	from, err := st.UpsertProject(ctx, `D:\workspaces\demo`, "from", "demo", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := st.UpsertProject(ctx, `D:\Workspaces\Demo`, "to", "Demo", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProjectAlias(ctx, from, "旧别名"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProjectPinned(ctx, from, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.TouchProject(ctx, from, 100); err != nil {
+		t.Fatal(err)
+	}
+	folder, err := st.CreateFolder(ctx, from, "归类", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := "11111111-2222-3333-4444-555555555551"
+	sess := model.Session{ID: id, ProjectID: from, Title: "会话", State: "ok",
+		FilePath: filepath.Join(t.TempDir(), id+".jsonl")}
+	if err := st.UpsertSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.MergeProject(ctx, from, to); err != nil {
+		t.Fatal(err)
+	}
+
+	paths, err := st.ListProjectPaths(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := paths[from]; ok {
+		t.Errorf("被合并的项目仍然存在")
+	}
+	project, err := st.GetProject(ctx, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.Alias != "旧别名" || !project.Pinned || project.LastOpenedAt != 100 {
+		t.Errorf("项目元数据未合并: %+v", project)
+	}
+	if project.SessionCount != 1 {
+		t.Errorf("sessions = %d, want 1", project.SessionCount)
+	}
+	folders, err := st.ListFolders(ctx, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 1 || folders[0].ID != folder.ID {
+		t.Errorf("folders = %+v, want %d", folders, folder.ID)
+	}
+}

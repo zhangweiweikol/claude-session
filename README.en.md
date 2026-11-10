@@ -17,7 +17,7 @@ Built with Go, SQLite, and vanilla front-end code. Ships as a single process and
 
 ## Features
 
-- **Grouped by project**: scans `~/.claude/projects` and groups sessions by the `cwd` in each jsonl; the list shows title, last prompt, timestamp, message count, token usage, and git branch
+- **Grouped by project**: scans `~/.claude/projects` and groups sessions by the `cwd` in each jsonl; the list shows title, last prompt, timestamp, message count, token usage, and git branch. On Windows, paths that differ only in casing are resolved to the real on-disk casing and merged into one project
 - **Full-text search**: FTS5 trigram (Chinese substring matching), plus title / prompt / session ID search, with `Ctrl+K` to focus
 - **Logical groups**: nested folders, move, and rename, stored in SQLite only — the directory layout under `~/.claude/projects` is never touched
 - **Lineage view**: parses `forkedFrom` and shows fork relationships, a family tree, fork points, and the full ancestry chain

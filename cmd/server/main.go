@@ -57,6 +57,13 @@ func main() {
 	cr := creator.New(*projectsDir, op.ClaudePath())
 	tr := trash.New(filepath.Join(home, ".claude-session", "trash"))
 
+	// 历史会话里同一个目录可能记录了不同大小写的 cwd，启动时合并成同一个项目。
+	if merged, err := sc.NormalizeProjects(context.Background()); err != nil {
+		log.Printf("校正项目路径失败: %v", err)
+	} else if merged > 0 {
+		log.Printf("已合并 %d 个仅大小写不同的重复项目", merged)
+	}
+
 	// AI 摘要通过本机 Claude Code 生成，临时目录固定，避免污染项目扫描。
 	aiWorkDir := filepath.Join(filepath.Dir(*dbPath), ".ai-tmp")
 	gen := aisvc.NewCLIGenerator(op.ClaudePath(), "", aiWorkDir)

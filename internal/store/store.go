@@ -354,6 +354,77 @@ ON CONFLICT(cwd) DO UPDATE SET
 	return id, err
 }
 
+// ListProjectPaths 返回项目 id 到 cwd 的映射，供启动时校正路径大小写。
+func (s *Store) ListProjectPaths(ctx context.Context) (map[int64]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, cwd FROM projects`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64]string)
+	for rows.Next() {
+		var id int64
+		var cwd string
+		if err := rows.Scan(&id, &cwd); err != nil {
+			return nil, err
+		}
+		out[id] = cwd
+	}
+	return out, rows.Err()
+}
+
+// RenameProjectCwd 把项目切换到规范路径，用于修正大小写差异。
+func (s *Store) RenameProjectCwd(ctx context.Context, id int64, cwd, encodedDir, name string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE projects SET cwd = ?, encoded_dir = ?, name = ? WHERE id = ?`,
+		cwd, encodedDir, name, id)
+	return err
+}
+
+// MergeProject 把 fromID 的会话、归类与项目元数据并入 toID，然后删除 fromID。
+// 两侧归类的名称不做去重，合并后可能出现同名归类，由用户自行整理。
+func (s *Store) MergeProject(ctx context.Context, fromID, toID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var pinned, lastOpened, lastScan int
+	var alias string
+	if err := tx.QueryRowContext(ctx, `
+SELECT pinned, last_opened_at, last_scan_at, alias FROM projects WHERE id = ?`, fromID).
+		Scan(&pinned, &lastOpened, &lastScan, &alias); err != nil {
+		return err
+	}
+
+	for _, stmt := range []string{
+		`UPDATE sessions SET project_id = ? WHERE project_id = ?`,
+		`UPDATE sessions SET display_project_id = ? WHERE display_project_id = ?`,
+		`UPDATE folders SET project_id = ? WHERE project_id = ?`,
+		`UPDATE ai_jobs SET project_id = ? WHERE project_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, toID, fromID); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+UPDATE projects SET
+  pinned = MAX(pinned, ?),
+  last_opened_at = MAX(last_opened_at, ?),
+  last_scan_at = MAX(last_scan_at, ?),
+  alias = CASE WHEN alias = '' THEN ? ELSE alias END
+WHERE id = ?`, pinned, lastOpened, lastScan, alias, toID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, fromID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpsertSession(ctx context.Context, sess model.Session) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO sessions(

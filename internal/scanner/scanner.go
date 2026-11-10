@@ -79,6 +79,16 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 	}
 
 	now := time.Now().Unix()
+	// 同一批会话常共享 cwd，缓存避免每个会话都逐级读目录。
+	cwdCache := make(map[string]string)
+	canonical := func(p string) string {
+		if v, ok := cwdCache[p]; ok {
+			return v
+		}
+		v := CanonicalCwd(p)
+		cwdCache[p] = v
+		return v
+	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -125,25 +135,27 @@ func (s *Scanner) Scan(ctx context.Context) (Result, error) {
 				continue
 			}
 
-			pid, err := s.store.UpsertProject(ctx, m.Cwd, EncodeCwd(m.Cwd), projectName(m.Cwd), now)
+			cwd := canonical(m.Cwd)
+			pid, err := s.store.UpsertProject(ctx, cwd, EncodeCwd(cwd), projectName(cwd), now)
 			if err != nil {
 				res.Errors = appendError(res.Errors, fmt.Sprintf("%s: %v", id, err))
 				continue
 			}
-			projects[m.Cwd] = true
+			projects[cwd] = true
 
 			var displayProjectID *int64
-			if m.LastCwd != "" && !strings.EqualFold(filepath.Clean(m.LastCwd), filepath.Clean(m.Cwd)) {
+			lastCwd := canonical(m.LastCwd)
+			if m.LastCwd != "" && !strings.EqualFold(filepath.Clean(lastCwd), filepath.Clean(cwd)) {
 				allowed, err := s.store.AutoDisplayAllowed(ctx, id)
 				if err != nil {
 					res.Errors = appendError(res.Errors, fmt.Sprintf("%s: 检查归属设置失败: %v", id, err))
 				} else if allowed {
-					lastPID, err := s.store.UpsertProject(ctx, m.LastCwd, EncodeCwd(m.LastCwd), projectName(m.LastCwd), now)
+					lastPID, err := s.store.UpsertProject(ctx, lastCwd, EncodeCwd(lastCwd), projectName(lastCwd), now)
 					if err != nil {
 						res.Errors = appendError(res.Errors, fmt.Sprintf("%s: 记录归属目录失败: %v", id, err))
 					} else {
 						displayProjectID = &lastPID
-						projects[m.LastCwd] = true
+						projects[lastCwd] = true
 					}
 				}
 			}
@@ -516,6 +528,97 @@ func isSessionID(name string) bool {
 		}
 	}
 	return true
+}
+
+// CanonicalCwd 逐级把路径还原为磁盘上的真实大小写。
+// Windows 不区分大小写，但会话里记录的 cwd 可能大小写混用；
+// 路径不存在或无法解析时原样返回。
+func CanonicalCwd(cwd string) string {
+	canonical, _ := canonicalCwd(cwd)
+	return canonical
+}
+
+// canonicalCwd 在还原成功时返回 true，供只处理真实存在路径的调用方判断。
+func canonicalCwd(cwd string) (string, bool) {
+	vol := filepath.VolumeName(cwd)
+	if vol == "" {
+		return cwd, false
+	}
+	parts := strings.FieldsFunc(cwd[len(vol):], func(r rune) bool {
+		return r == '\\' || r == '/'
+	})
+	if len(parts) == 0 {
+		return cwd, true
+	}
+	cur := vol + string(filepath.Separator)
+	for _, part := range parts {
+		entries, err := os.ReadDir(cur)
+		if err != nil {
+			return cwd, false
+		}
+		name := ""
+		for _, e := range entries {
+			if strings.EqualFold(e.Name(), part) {
+				name = e.Name()
+				break
+			}
+		}
+		if name == "" {
+			return cwd, false
+		}
+		cur = filepath.Join(cur, name)
+	}
+	return cur, true
+}
+
+// NormalizeProjects 把 projects 表中的 cwd 校正为磁盘真实大小写，
+// 并合并同一物理路径的重复项目（Windows 下仅大小写不同）。
+// 返回合并掉的项目数。
+func (s *Scanner) NormalizeProjects(ctx context.Context) (int, error) {
+	paths, err := s.store.ListProjectPaths(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	groups := make(map[string][]int64)
+	canonicalOf := make(map[string]string)
+	for id, cwd := range paths {
+		canonical, ok := canonicalCwd(cwd)
+		if !ok {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(canonical))
+		groups[key] = append(groups[key], id)
+		canonicalOf[key] = canonical
+	}
+
+	merged := 0
+	for key, ids := range groups {
+		canonical := canonicalOf[key]
+		keep := ids[0]
+		// 优先保留路径已经正确的那一行，避免无谓改名。
+		for _, id := range ids {
+			if paths[id] == canonical {
+				keep = id
+				break
+			}
+		}
+		for _, id := range ids {
+			if id == keep {
+				continue
+			}
+			if err := s.store.MergeProject(ctx, id, keep); err != nil {
+				return merged, err
+			}
+			merged++
+		}
+		if paths[keep] != canonical {
+			if err := s.store.RenameProjectCwd(ctx, keep, canonical, EncodeCwd(canonical), projectName(canonical)); err != nil {
+				return merged, err
+			}
+		}
+	}
+	return merged, nil
 }
 
 // EncodeCwd 复刻 Claude Code 的项目目录命名规则：非字母数字字符替换为 '-'。

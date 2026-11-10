@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"claude-session/internal/model"
 	"claude-session/internal/store"
 )
 
@@ -181,6 +183,101 @@ func TestScanInheritsParentFolder(t *testing.T) {
 	}
 	if child.FolderID == nil || *child.FolderID != folder.ID {
 		t.Errorf("child folder = %v, want %d", child.FolderID, folder.ID)
+	}
+}
+
+func TestCanonicalCwd(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 的路径不区分大小写")
+	}
+	root := t.TempDir()
+	real := filepath.Join(root, "RealDir", "SubDir")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := CanonicalCwd(filepath.Join(root, "realdir", "subdir")); got != real {
+		t.Errorf("CanonicalCwd = %q, want %q", got, real)
+	}
+	missing := filepath.Join(root, "not-exist")
+	if got := CanonicalCwd(missing); got != missing {
+		t.Errorf("不存在的路径应原样返回，got %q", got)
+	}
+}
+
+func TestNormalizeProjectsMergesCaseVariants(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows 的路径不区分大小写")
+	}
+	root := t.TempDir()
+	real := filepath.Join(root, "RealProject")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(root, "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	pidUpper, err := st.UpsertProject(ctx, real, "enc-upper", "RealProject", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidLower, err := st.UpsertProject(ctx, filepath.Join(root, "realproject"), "enc-lower", "realproject", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := []string{
+		"11111111-2222-3333-4444-555555555551",
+		"11111111-2222-3333-4444-555555555552",
+	}
+	for i, pid := range []int64{pidUpper, pidLower} {
+		sess := model.Session{
+			ID: ids[i], ProjectID: pid, Title: "会话", State: "ok",
+			FilePath: filepath.Join(root, ids[i]+".jsonl"),
+		}
+		if err := st.UpsertSession(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.SetSessionProject(ctx, ids[1], &pidLower); err != nil {
+		t.Fatal(err)
+	}
+	folder, err := st.CreateFolder(ctx, pidLower, "归类", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sc := New(t.TempDir(), st)
+	merged, err := sc.NormalizeProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged != 1 {
+		t.Errorf("merged = %d, want 1", merged)
+	}
+
+	projects, err := st.ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("projects = %d, want 1", len(projects))
+	}
+	if projects[0].Cwd != real {
+		t.Errorf("cwd = %q, want %q", projects[0].Cwd, real)
+	}
+	if projects[0].SessionCount != 2 {
+		t.Errorf("sessions = %d, want 2", projects[0].SessionCount)
+	}
+	folders, err := st.ListFolders(ctx, projects[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 1 || folders[0].ID != folder.ID {
+		t.Errorf("folders = %+v, want 归类 %d", folders, folder.ID)
 	}
 }
 

@@ -17,7 +17,7 @@ Go + SQLite + 原生前端，单进程、单二进制，只监听 `127.0.0.1`。
 
 ## 特性
 
-- **项目归并**：扫描 `~/.claude/projects`，按 jsonl 中的 `cwd` 归并项目，列表展示标题、最后 prompt、时间、消息数、token 用量、git 分支
+- **项目归并**：扫描 `~/.claude/projects`，按 jsonl 中的 `cwd` 归并项目，列表展示标题、最后 prompt、时间、消息数、token 用量、git 分支；Windows 下仅大小写不同的路径会还原为磁盘真实大小写并合并为同一个项目
 - **全文搜索**：FTS5 trigram（支持中文子串），也可按标题 / prompt / 会话 ID 搜索，`Ctrl+K` 唤起
 - **逻辑归类**：多层嵌套分组、移动、重命名，只写 SQLite，不改动 Claude Code 的目录结构
 - **谱系视图**：解析 `forkedFrom`，展示派生关系、家族树、分叉点与完整血缘链
