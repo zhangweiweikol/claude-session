@@ -1233,8 +1233,7 @@
   function aiCardHtml(detail) {
     var s = detail.session;
     var a = detail.ai;
-    var head = '<div class="ai-card-head"><span class="ai-card-title">AI 概要</span>' +
-      (a && a.status === 'ok' ? '<span class="ai-badge">AI</span>' : '') + '</div>';
+    var head = '<div class="ai-card-head"><span class="ai-card-title">AI 概要</span></div>';
 
     if (!a) {
       return '<div class="ai-card is-empty">' + head +
