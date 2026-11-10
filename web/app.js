@@ -2805,6 +2805,7 @@
   function newSessionDialog() {
     return new Promise(function (resolve) {
       var root = $('#modalRoot');
+      var initialFolderID = state.folderFilter.indexOf('f:') === 0 ? Number(state.folderFilter.slice(2)) || 0 : 0;
       var projectOptions = state.projects.map(function (p) {
         return '<option value="' + p.id + '"' + (p.id === state.projectId ? ' selected' : '') + '>' +
           esc(p.name) + ' — ' + esc(p.cwd) + '</option>';
@@ -2818,7 +2819,7 @@
         '<div class="modal-body">' +
         '<div class="field-row">' +
         '<div class="field"><label for="nsProject">项目</label><select id="nsProject">' + projectOptions + '</select></div>' +
-        '<div class="field"><label for="nsFolder">归类</label><select id="nsFolder">' + folderOptions(state.folders, 0) + '</select></div>' +
+        '<div class="field"><label for="nsFolder">归类</label><select id="nsFolder">' + folderOptions(state.folders, initialFolderID) + '</select></div>' +
         '</div>' +
         '<div class="field"><label for="nsTitle">标题（可选）</label>' +
         '<input class="text-input" id="nsTitle" autocomplete="off" placeholder="留空则由 Claude Code 自动生成"></div>' +
