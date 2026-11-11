@@ -44,6 +44,7 @@
   };
   var listSeq = 0;
   var detailSeq = 0;
+  var threadNavRaf = 0;
   var searchTimer = null;
   var toastTimer = null;
 
@@ -1194,11 +1195,13 @@
         '<div class="state-actions"><button class="btn btn-primary" data-action="clear-search">清除搜索</button>' +
         '<button class="btn" data-action="reset">查看全部</button></div>' +
         '</div></div>';
+      updateThreadNav();
       return;
     }
     $('#thread').innerHTML = '<div class="thread-inner"><div class="thread-empty">' +
       '<h3>选择会话</h3><p>从目录中选择一条会话开始阅读，或使用右上角的新建会话。</p>' +
       '</div></div>';
+    updateThreadNav();
   }
 
   function selectSession(id) {
@@ -1217,6 +1220,7 @@
       '<div class="skeleton-item"><span class="sk sk-time"></span><div class="sk-main"><i class="sk sk-title"></i><i class="sk sk-line"></i></div></div>' +
       '<div class="skeleton-item"><span class="sk sk-time"></span><div class="sk-main"><i class="sk sk-title"></i><i class="sk sk-line"></i></div></div>' +
       '</div></div>';
+    updateThreadNav();
 
     return api('/api/sessions/' + encodeURIComponent(id)).then(function (detail) {
       if (seq !== detailSeq) return;
@@ -1367,6 +1371,7 @@
 
     $('#thread').innerHTML = '<div class="thread-inner">' + aiCardHtml(detail) + renderMessages(detail) + '</div>';
     renderLineage(s, detail);
+    updateThreadNav();
     var genBtn = $('#thread [data-ai-generate]');
     if (genBtn) {
       genBtn.addEventListener('click', function () {
@@ -1409,6 +1414,28 @@
     $('#btnExport').addEventListener('click', openExportDialog);
     $('#btnCopy').addEventListener('click', copyResume);
     $('#btnDelete').addEventListener('click', deleteCurrent);
+  }
+
+  // 阅读区跳转按钮：内容较长且离开顶部/底部一定距离时显示。
+  function updateThreadNav() {
+    var el = $('#thread');
+    var nav = $('#threadNav');
+    var top = $('#btnScrollTop');
+    var bottom = $('#btnScrollBottom');
+    if (!el || !nav || !top || !bottom) return;
+    var overflow = el.scrollHeight - el.clientHeight;
+    var showTop = overflow > 120 && el.scrollTop > 200;
+    var showBottom = overflow > 120 && (overflow - el.scrollTop) > 200;
+    top.hidden = !showTop;
+    bottom.hidden = !showBottom;
+    nav.hidden = !showTop && !showBottom;
+  }
+
+  function scrollThreadTo(where) {
+    var el = $('#thread');
+    if (!el) return;
+    el.scrollTo({ top: where === 'bottom' ? el.scrollHeight : 0, behavior: 'auto' });
+    updateThreadNav();
   }
 
   // 详情页血缘：根 › 父 › 当前，父链由 /ancestors 补全，分叉点来自 forkedFrom。
@@ -3746,6 +3773,18 @@
         loadSessions();
       }
     });
+
+    $('#thread').addEventListener('scroll', function () {
+      if (threadNavRaf) return;
+      threadNavRaf = requestAnimationFrame(function () {
+        threadNavRaf = 0;
+        updateThreadNav();
+      });
+    }, { passive: true });
+
+    $('#btnScrollTop').addEventListener('click', function () { scrollThreadTo('top'); });
+    $('#btnScrollBottom').addEventListener('click', function () { scrollThreadTo('bottom'); });
+    window.addEventListener('resize', updateThreadNav);
 
     $('#thread').addEventListener('click', function (e) {
       if (e.target.closest('[data-action="clear-search"]')) {
