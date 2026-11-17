@@ -17,13 +17,21 @@ type Project struct {
 
 // Folder 是纯逻辑归类，只存在于本系统的 SQLite 中，不改变 Claude Code 的目录结构。
 type Folder struct {
-	ID          int64  `json:"id"`
-	ProjectID   int64  `json:"project_id"`
-	ParentID    *int64 `json:"parent_id"`
-	Name        string `json:"name"`
-	SortOrder   int    `json:"sort_order"`
-	Source      string `json:"source,omitempty"`      // user|ai
-	Description string `json:"description,omitempty"` // AI 生成的归类说明
+	ID           int64  `json:"id"`
+	ProjectID    int64  `json:"project_id"`
+	ParentID     *int64 `json:"parent_id"`
+	Name         string `json:"name"`
+	SortOrder    int    `json:"sort_order"`
+	Source       string `json:"source,omitempty"`      // user|ai
+	Description  string `json:"description,omitempty"` // AI 生成的归类说明
+	SessionCount int    `json:"session_count"`         // 直属该归类的会话数，不含子归类
+}
+
+// SessionCounts 是归类树固定项的会话数：全部、待归类、回收站。
+type SessionCounts struct {
+	All     int `json:"all"`
+	Unfiled int `json:"unfiled"`
+	Deleted int `json:"deleted"`
 }
 
 // Session 是一条 Claude Code 会话的索引记录，真值始终是对应的 jsonl 文件。
@@ -146,5 +154,7 @@ type SessionFilter struct {
 	Categorized bool
 	Query       string
 	Deleted     bool
-	Limit       int
+	// IncludeDeleted 让结果同时包含正常与已删除会话，用于跨归类搜索。
+	IncludeDeleted bool
+	Limit          int
 }

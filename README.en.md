@@ -18,7 +18,7 @@ Built with Go, SQLite, and vanilla front-end code. Ships as a single process and
 ## Features
 
 - **Grouped by project**: scans `~/.claude/projects` and groups sessions by the `cwd` in each jsonl; the list shows title, last prompt, timestamp, message count, token usage, and git branch. On Windows, paths that differ only in casing are resolved to the real on-disk casing and merged into one project
-- **Full-text search**: FTS5 trigram (Chinese substring matching), plus title / prompt / session ID search, with `Ctrl+K` to focus
+- **Full-text search**: FTS5 trigram (Chinese substring matching), plus title / prompt / session ID search, with `Ctrl+K` to focus; the search covers the whole current project across groups, including sessions in the trash
 - **Logical groups**: nested folders, move, and rename, stored in SQLite only — the directory layout under `~/.claude/projects` is never touched. Switching projects defaults to "Categorized" and remembers each project's last selected group view
 - **Lineage view**: parses `forkedFrom` and shows fork relationships, a family tree, fork points, and the full ancestry chain
 - **Session actions**: resume, rename, compact, branch, fork, bulk delete, and trash restore
@@ -111,7 +111,7 @@ POST   /api/projects/{id}/folders      { name, parent_id? }
 PATCH  /api/projects/{id}/folders/{folder}   { name }
 POST   /api/projects/{id}/folders/{folder}/move  { direction: up|down }
 DELETE /api/projects/{id}/folders/{folder}
-GET    /api/sessions?project_id=&folder_id=&q=&deleted=&limit=
+GET    /api/sessions?project_id=&folder_id=&q=&deleted=&include_deleted=&limit=
 POST   /api/sessions                   { project_id, folder_id, title, first_message, mode }
 POST   /api/sessions/batch-delete      { ids, permanent }
 GET    /api/sessions/{id}

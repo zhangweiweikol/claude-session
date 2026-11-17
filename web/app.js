@@ -15,6 +15,7 @@
     projects: [],
     projectId: null,
     folders: [],
+    counts: { all: 0, unfiled: 0, deleted: 0 },
     folderFilter: 'unfiled',
     sessions: [],
     sessionId: null,
@@ -286,6 +287,7 @@
     if (!state.projectId) return Promise.resolve();
     return api('/api/projects/' + state.projectId + '/folders').then(function (data) {
       state.folders = data.folders || [];
+      state.counts = data.counts || { all: 0, unfiled: 0, deleted: 0 };
       if (!state.expandedInit) {
         state.expanded = { categorized: true };
         state.folders.filter(function (f) { return !f.parent_id; }).forEach(function (f) {
@@ -304,8 +306,8 @@
     var q = state.folderQuery.trim().toLowerCase();
     var html = '';
 
-    html += folderStaticItem('all', '全部', '', FOLDER_ICON);
-    html += folderStaticItem('unfiled', '待归类', '', FOLDER_ICON);
+    html += folderStaticItem('all', '全部', state.counts.all, FOLDER_ICON);
+    html += folderStaticItem('unfiled', '待归类', state.counts.unfiled, FOLDER_ICON);
 
     if (!q) {
       html += categorizedRow(false);
@@ -314,7 +316,7 @@
           html += renderTree(f, 1, String(i + 1), '', null);
         });
       }
-      html += folderStaticItem('trash', '回收站', '', TRASH_ICON);
+      html += folderStaticItem('trash', '回收站', state.counts.deleted, TRASH_ICON);
       root.innerHTML = html;
       return;
     }
@@ -340,7 +342,7 @@
       html += '<div class="folder-empty">没有匹配的归类' +
         '<button class="btn btn-sm" data-clear-folder-search>清除搜索</button></div>';
     }
-    html += folderStaticItem('trash', '回收站', '', TRASH_ICON);
+    html += folderStaticItem('trash', '回收站', state.counts.deleted, TRASH_ICON);
     root.innerHTML = html;
   }
 
@@ -350,7 +352,8 @@
     return '<div class="folder-row' + (active ? ' is-active' : '') + '" style="padding-left:0">' +
       '<button class="folder-item' + (active ? ' is-active' : '') + '" data-toggle-categorized="1">' +
       chevIcon(expanded, true) + (expanded ? FOLDER_OPEN_ICON : FOLDER_ICON) +
-      '<span class="f-name">已归类</span><span></span></button>' +
+      '<span class="f-name">已归类</span>' +
+      '<span class="f-count">' + (state.counts.all - state.counts.unfiled) + '</span></button>' +
       '<span class="folder-actions">' +
       '<button class="folder-act" data-add-folder="0" title="新建归类" aria-label="新建归类">+</button>' +
       '</span></div>';
@@ -378,7 +381,7 @@
       '<span class="f-name">' + nameHtml +
       (folder.source === 'ai' ? '<span class="f-ai" title="AI 创建的归类">AI</span>' : '') + '</span>' +
       (!query && kids.length > 0 && depth >= maxDepth ? '<span class="f-more">…</span>' : '') +
-      '<span></span></button>' +
+      '<span class="f-count">' + folder.session_count + '</span></button>' +
       '<span class="folder-actions">' +
       '<button class="folder-act" data-folder-resume="' + folder.id + '" title="恢复最后一次会话" aria-label="恢复最后一次会话">' + PLAY_ICON + '</button>' +
       '<button class="folder-act" data-folder-up="' + folder.id + '" title="上移" aria-label="上移"' + (canUp ? '' : ' disabled') + '>↑</button>' +
@@ -509,6 +512,9 @@
     if (filter !== 'trash') rememberFilter(state.projectId, filter);
     state.crumbExpanded = false;
     state.sessionId = null;
+    // 搜索忽略归类，切换归类时必须清掉搜索词，否则点归类看起来没反应。
+    state.query = '';
+    $('#search').value = '';
     initialHash = null;
     resetSelection();
     clearDetail();
@@ -730,13 +736,16 @@
     var seq = ++listSeq;
     if (!silent) renderListState('loading');
     var params = new URLSearchParams({ project_id: state.projectId });
-    if (state.folderFilter === 'trash') {
+    if (state.query) {
+      // 搜索范围是整个项目：忽略当前归类，并带上回收站里的会话。
+      params.set('q', state.query);
+      params.set('include_deleted', '1');
+    } else if (state.folderFilter === 'trash') {
       params.set('deleted', '1');
     } else {
       var fp = folderParam();
       if (fp) params.set('folder_id', fp);
     }
-    if (state.query) params.set('q', state.query);
 
     return api('/api/sessions?' + params.toString()).then(function (data) {
       if (seq !== listSeq) return;

@@ -429,3 +429,87 @@ func TestMergeProjectKeepsMetadata(t *testing.T) {
 		t.Errorf("folders = %+v, want %d", folders, folder.ID)
 	}
 }
+
+func TestSearchAcrossFoldersIncludesDeleted(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "search.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	pid, err := st.UpsertProject(ctx, t.TempDir(), "dir-p", "P", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := st.CreateFolder(ctx, pid, "归类A", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type seed struct {
+		id     string
+		title  string
+		folder *int64
+	}
+	items := []seed{
+		{"11111111-1111-4111-8111-111111111111", "登录失败排查", &folder.ID},
+		{"22222222-2222-4222-8222-222222222222", "登录失败记录", nil},
+		{"33333333-3333-4333-8333-333333333333", "登录失败复现", &folder.ID},
+	}
+	for _, it := range items {
+		sess := model.Session{
+			ID: it.id, ProjectID: pid, Title: it.title,
+			FilePath: filepath.Join(t.TempDir(), it.id+".jsonl"), State: "ok",
+		}
+		if err := st.UpsertSession(ctx, sess); err != nil {
+			t.Fatal(err)
+		}
+		if it.folder != nil {
+			if err := st.SetSessionFolder(ctx, it.id, it.folder); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := st.IndexSession(ctx, it.id, it.title, it.title, it.title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.MarkDeleted(ctx, items[2].id, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	// 长查询走 FTS，短查询走 LIKE，两者都要覆盖回收站里的会话。
+	for _, q := range []string{"登录", "登录失败"} {
+		got, err := st.ListSessions(ctx, model.SessionFilter{ProjectID: pid, Query: q, IncludeDeleted: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 3 {
+			t.Errorf("q=%q 跨归类搜索结果 = %d, want 3", q, len(got))
+		}
+		got, err = st.ListSessions(ctx, model.SessionFilter{ProjectID: pid, Query: q})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Errorf("q=%q 不含回收站结果 = %d, want 2", q, len(got))
+		}
+	}
+
+	folders, err := st.ListFolders(ctx, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 1 || folders[0].SessionCount != 1 {
+		t.Errorf("归类计数 = %+v, want 1（不含已删除）", folders)
+	}
+
+	counts, err := st.SessionCounts(ctx, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := model.SessionCounts{All: 2, Unfiled: 1, Deleted: 1}
+	if counts != want {
+		t.Errorf("固定项计数 = %+v, want %+v", counts, want)
+	}
+}

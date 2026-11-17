@@ -18,7 +18,7 @@ Go + SQLite + 原生前端，单进程、单二进制，只监听 `127.0.0.1`。
 ## 特性
 
 - **项目归并**：扫描 `~/.claude/projects`，按 jsonl 中的 `cwd` 归并项目，列表展示标题、最后 prompt、时间、消息数、token 用量、git 分支；Windows 下仅大小写不同的路径会还原为磁盘真实大小写并合并为同一个项目
-- **全文搜索**：FTS5 trigram（支持中文子串），也可按标题 / prompt / 会话 ID 搜索，`Ctrl+K` 唤起
+- **全文搜索**：FTS5 trigram（支持中文子串），也可按标题 / prompt / 会话 ID 搜索，`Ctrl+K` 唤起；搜索范围是整个当前项目，跨归类并包含回收站里的会话
 - **逻辑归类**：多层嵌套分组、移动、重命名，只写 SQLite，不改动 Claude Code 的目录结构；切换项目时默认回到「已归类」，并记住每个项目上次选择的归类视图
 - **谱系视图**：解析 `forkedFrom`，展示派生关系、家族树、分叉点与完整血缘链
 - **会话操作**：恢复、重命名、压缩、分支、副本、批量删除与回收站还原
@@ -111,7 +111,7 @@ POST   /api/projects/{id}/folders      { name, parent_id? }
 PATCH  /api/projects/{id}/folders/{folder}   { name }
 POST   /api/projects/{id}/folders/{folder}/move  { direction: up|down }
 DELETE /api/projects/{id}/folders/{folder}
-GET    /api/sessions?project_id=&folder_id=&q=&deleted=&limit=
+GET    /api/sessions?project_id=&folder_id=&q=&deleted=&include_deleted=&limit=
 POST   /api/sessions                   { project_id, folder_id, title, first_message, mode }
 POST   /api/sessions/batch-delete      { ids, permanent }
 GET    /api/sessions/{id}

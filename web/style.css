@@ -343,7 +343,12 @@ body.is-resizing.is-row{cursor:row-resize}
   flex:none;min-width:0;letter-spacing:0;
 }
 .folder-item .f-more{font-size:11px;color:var(--ink-3);flex:none}
-.folder-item>span:last-child{font-size:var(--fs-1);color:var(--ink-3);font-variant-numeric:tabular-nums}
+.folder-item>span:last-child{
+  font-size:var(--fs-1);color:var(--ink-3);font-variant-numeric:tabular-nums;
+  flex:none;min-width:2ch;text-align:right;line-height:1;
+}
+/* 悬停时右侧操作按钮浮层会盖住计数，先隐藏避免叠字。 */
+.folder-row:hover .f-count{opacity:0}
 .folder-item.is-child{padding-left:26px}
 .folder-item .folder-ico{color:var(--ink-3);flex:none}
 .folder-item.is-active .folder-ico{color:var(--primary)}
@@ -354,7 +359,7 @@ body.is-resizing.is-row{cursor:row-resize}
 .folder-row{position:relative;display:flex;align-items:center;min-width:0;border-left:2px solid transparent;border-radius:2px;transition:background .12s ease}
 .folder-row:hover{background:var(--surface-2)}
 .folder-row.is-active{background:var(--nav-active);border-left-color:var(--primary)}
-.folder-row>.folder-item{flex:1;min-width:0;padding-right:2px;border-left:0;border-radius:0;background:transparent!important}
+.folder-row>.folder-item{flex:1;min-width:0;padding-right:8px;border-left:0;border-radius:0;background:transparent!important}
 .folder-row>.folder-item:hover{background:transparent;color:var(--ink)}
 .folder-row>.folder-item.is-active{background:transparent!important;border-left-color:transparent}
 .folder-actions{

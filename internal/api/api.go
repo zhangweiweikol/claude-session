@@ -357,7 +357,12 @@ func (s *Server) listFolders(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"folders": folders})
+	counts, err := s.store.SessionCounts(r.Context(), projectID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"folders": folders, "counts": counts})
 }
 
 func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
@@ -517,8 +522,9 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filter := model.SessionFilter{
-		ProjectID: projectID,
-		Deleted:   r.URL.Query().Get("deleted") == "1",
+		ProjectID:      projectID,
+		Deleted:        r.URL.Query().Get("deleted") == "1",
+		IncludeDeleted: r.URL.Query().Get("include_deleted") == "1",
 	}
 	switch raw := r.URL.Query().Get("folder_id"); raw {
 	case "", "all":

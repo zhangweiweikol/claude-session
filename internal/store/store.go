@@ -534,9 +534,10 @@ ORDER BY p.pinned DESC, p.sort_order ASC, COUNT(s.id) DESC, p.cwd ASC`)
 
 func (s *Store) ListFolders(ctx context.Context, projectID int64) ([]model.Folder, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, project_id, parent_id, name, sort_order, source, description
-FROM folders WHERE project_id = ?
-ORDER BY sort_order ASC, name ASC, id ASC`, projectID)
+SELECT f.id, f.project_id, f.parent_id, f.name, f.sort_order, f.source, f.description,
+       (SELECT COUNT(*) FROM sessions s WHERE s.folder_id = f.id AND s.state = 'ok')
+FROM folders f WHERE f.project_id = ?
+ORDER BY f.sort_order ASC, f.name ASC, f.id ASC`, projectID)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +547,7 @@ ORDER BY sort_order ASC, name ASC, id ASC`, projectID)
 	for rows.Next() {
 		var f model.Folder
 		var parent sql.NullInt64
-		if err := rows.Scan(&f.ID, &f.ProjectID, &parent, &f.Name, &f.SortOrder, &f.Source, &f.Description); err != nil {
+		if err := rows.Scan(&f.ID, &f.ProjectID, &parent, &f.Name, &f.SortOrder, &f.Source, &f.Description, &f.SessionCount); err != nil {
 			return nil, err
 		}
 		if parent.Valid {
@@ -556,6 +557,19 @@ ORDER BY sort_order ASC, name ASC, id ASC`, projectID)
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// SessionCounts 按左侧固定项的口径统计当前项目会话数，与对应列表查询保持一致。
+func (s *Store) SessionCounts(ctx context.Context, projectID int64) (model.SessionCounts, error) {
+	var out model.SessionCounts
+	err := s.db.QueryRowContext(ctx, `
+SELECT COALESCE(SUM(CASE WHEN s.state = 'ok' THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN s.state = 'ok' AND s.folder_id IS NULL THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN s.state = 'deleted' THEN 1 ELSE 0 END), 0)
+FROM sessions s
+WHERE COALESCE(s.display_project_id, s.project_id) = ?`, projectID).
+		Scan(&out.All, &out.Unfiled, &out.Deleted)
+	return out, err
 }
 
 func (s *Store) CreateFolder(ctx context.Context, projectID int64, name string, parentID *int64, now int64) (model.Folder, error) {
@@ -596,14 +610,24 @@ func (s *Store) ListSessions(ctx context.Context, f model.SessionFilter) ([]mode
 
 	var where []string
 	var args []any
+	// IncludeDeleted 用于跨归类搜索：同时返回正常与回收站里的会话。
+	addStateFilter := func() {
+		if f.IncludeDeleted {
+			where = append(where, "s.state IN ('ok', 'deleted')")
+			return
+		}
+		where = append(where, "s.state = ?")
+		args = append(args, state)
+	}
+
 	if f.FolderID != nil {
 		// 归类 id 全局唯一，直接按归类过滤；会话的展示项目可能随 cwd 漂移，
 		// 不应因此从归类里消失。
-		where = append(where, "s.state = ?")
-		args = append(args, state)
+		addStateFilter()
 	} else {
-		where = append(where, "COALESCE(s.display_project_id, s.project_id) = ?", "s.state = ?")
-		args = append(args, f.ProjectID, state)
+		where = append(where, "COALESCE(s.display_project_id, s.project_id) = ?")
+		args = append(args, f.ProjectID)
+		addStateFilter()
 	}
 	if f.Unfiled {
 		where = append(where, "s.folder_id IS NULL")
