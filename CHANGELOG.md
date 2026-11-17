@@ -11,6 +11,7 @@
 
 - 顶部搜索改为跨归类：只按当前项目过滤，待归类、已归类与回收站里的会话一次性搜出；切换归类时自动清空搜索词
 - 归类树在归类名后显示直属会话数（不含已删除会话与子归类）；「全部」「待归类」「已归类」「回收站」也显示各自会话数
+- 归类树条目字号由 15px 调至 13.5px，与搜索框、面包屑等侧栏控件保持一致
 - `GET /api/sessions` 新增 `include_deleted` 参数；`GET /api/projects/{id}/folders` 返回 `folders` 中新增 `session_count`，并新增 `counts`（all / unfiled / deleted）
 
 ## [0.3.0] - 2026-11-11
